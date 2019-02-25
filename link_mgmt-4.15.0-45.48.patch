@@ -1,0 +1,414 @@
+diff --git a/drivers/ntb/Kconfig b/drivers/ntb/Kconfig
+index 95944e5..6803955 100644
+--- a/drivers/ntb/Kconfig
++++ b/drivers/ntb/Kconfig
+@@ -12,6 +12,15 @@ menuconfig NTB
+ 
+ if NTB
+ 
++config NTB_LINK_MGMT
++	bool "Link management to avoid PCIe Rd for link detection"
++	help
++	 This is an additional option that is based on using 1 MSI-X per NTB DB
++	 and moves the NTB link detection to use purely MSI rather than making
++	 CPU read of MAGIC bytes over PCIe.
++
++	 If unsure, say N.
++
+ source "drivers/ntb/hw/Kconfig"
+ 
+ source "drivers/ntb/test/Kconfig"
+diff --git a/drivers/ntb/hw/mscc/ntb_hw_switchtec.c b/drivers/ntb/hw/mscc/ntb_hw_switchtec.c
+index afe8ed6..c666297 100644
+--- a/drivers/ntb/hw/mscc/ntb_hw_switchtec.c
++++ b/drivers/ntb/hw/mscc/ntb_hw_switchtec.c
+@@ -67,6 +67,30 @@ static inline void _iowrite64(u64 val, void __iomem *mmio)
+ #define SWITCHTEC_NTB_MAGIC 0x45CC0001
+ #define MAX_MWS     128
+ 
++#ifdef CONFIG_NTB_LINK_MGMT
++/* in-case we wanted to supported DB less than default(28).
++ * This value should never exceed set MSB > 28. Because we do not
++ * have DT support, either use this or make it module parameter.
++ */
++#define ALLOWED_DB	(0x0FFFFFFF)
++
++/* assign distinct msi-x vectors to each db/msg.*/
++enum {
++	LINK_DOWN_VEC = 0,
++	LINK_UP_VEC = 1,
++	PARTITION_EVENT_VEC = 2,
++	DB_START_VEC = 3,
++	DB_END_VEC = 30,
++	UNUSED_VEC = 31,
++	MAXIMUM_VEC = 32,
++};
++
++struct switchtec_irq {
++	int irq_num;
++	bool isr_attached;
++};
++#endif //CONFIG_NTB_LINK_MGMT
++
+ struct shared_mw {
+ 	u32 magic;
+ 	u32 link_sta;
+@@ -85,8 +109,12 @@ struct switchtec_ntb {
+ 	int self_partition;
+ 	int peer_partition;
+ 
++#ifdef CONFIG_NTB_LINK_MGMT
++	struct switchtec_irq irqs[MAXIMUM_VEC];
++#else
+ 	int doorbell_irq;
+ 	int message_irq;
++#endif
+ 
+ 	struct ntb_info_regs __iomem *mmio_ntb;
+ 	struct ntb_ctrl_regs __iomem *mmio_ctrl;
+@@ -470,6 +498,15 @@ enum {
+ 	MSG_CHECK_LINK = 3,
+ };
+ 
++#ifdef CONFIG_NTB_LINK_MGMT
++enum {
++	MSG_REG_1 = 0,
++	MSG_REG_2 = 1,
++	MSG_REG_3 = 2,
++	MSG_REG_4 = 3,
++};
++#endif
++
+ static void switchtec_ntb_check_link(struct switchtec_ntb *sndev)
+ {
+ 	int link_sta;
+@@ -489,7 +526,15 @@ static void switchtec_ntb_check_link(struct switchtec_ntb *sndev)
+ 	switchtec_ntb_set_link_speed(sndev);
+ 
+ 	if (link_sta != old) {
++#ifdef CONFIG_NTB_LINK_MGMT
++		if (link_sta) {
++			switchtec_ntb_send_msg(sndev, MSG_REG_1, MSG_LINK_UP);
++		} else {
++			switchtec_ntb_send_msg(sndev, MSG_REG_2, MSG_LINK_DOWN);
++		}
++#else
+ 		switchtec_ntb_send_msg(sndev, LINK_MESSAGE, MSG_CHECK_LINK);
++#endif
+ 		ntb_link_event(&sndev->ntb);
+ 		dev_info(&sndev->stdev->dev, "ntb link %s",
+ 			 link_sta ? "up" : "down");
+@@ -526,9 +571,13 @@ static int switchtec_ntb_link_enable(struct ntb_dev *ntb,
+ 	dev_dbg(&sndev->stdev->dev, "enabling link");
+ 
+ 	sndev->self_shared->link_sta = 1;
++#ifdef CONFIG_NTB_LINK_MGMT
++	switchtec_ntb_send_msg(sndev, MSG_REG_1, MSG_LINK_UP);
++#else
+ 	switchtec_ntb_send_msg(sndev, LINK_MESSAGE, MSG_LINK_UP);
+ 
+ 	switchtec_ntb_check_link(sndev);
++#endif
+ 
+ 	return 0;
+ }
+@@ -540,10 +589,13 @@ static int switchtec_ntb_link_disable(struct ntb_dev *ntb)
+ 	dev_dbg(&sndev->stdev->dev, "disabling link");
+ 
+ 	sndev->self_shared->link_sta = 0;
++#ifdef CONFIG_NTB_LINK_MGMT
++	switchtec_ntb_send_msg(sndev, MSG_REG_2, MSG_LINK_DOWN);
++#else
+ 	switchtec_ntb_send_msg(sndev, LINK_MESSAGE, MSG_LINK_UP);
+ 
+ 	switchtec_ntb_check_link(sndev);
+-
++#endif
+ 	return 0;
+ }
+ 
+@@ -556,16 +608,25 @@ static u64 switchtec_ntb_db_valid_mask(struct ntb_dev *ntb)
+ 
+ static int switchtec_ntb_db_vector_count(struct ntb_dev *ntb)
+ {
++#ifdef CONFIG_NTB_LINK_MGMT
++	struct switchtec_ntb *sndev = ntb_sndev(ntb);
++	return fls(sndev->db_valid_mask);
++#else
+ 	return 1;
++#endif
+ }
+ 
+ static u64 switchtec_ntb_db_vector_mask(struct ntb_dev *ntb, int db_vector)
+ {
+ 	struct switchtec_ntb *sndev = ntb_sndev(ntb);
+ 
++#ifdef CONFIG_NTB_LINK_MGMT
++	if (db_vector < DB_START_VEC || db_vector > DB_END_VEC)
++		return 0;
++#else
+ 	if (db_vector < 0 || db_vector > 1)
+ 		return 0;
+-
++#endif
+ 	return sndev->db_valid_mask;
+ }
+ 
+@@ -855,6 +916,10 @@ static void switchtec_ntb_init_db(struct switchtec_ntb *sndev)
+ {
+ 	sndev->db_valid_mask = 0x0FFFFFFF;
+ 
++#ifdef CONFIG_NTB_LINK_MGMT
++	sndev->db_valid_mask = ALLOWED_DB;
++#endif
++
+ 	if (sndev->self_partition < sndev->peer_partition) {
+ 		sndev->db_shift = 0;
+ 		sndev->db_peer_shift = 32;
+@@ -940,7 +1005,9 @@ static void switchtec_ntb_init_shared(struct switchtec_ntb *sndev)
+ 	int i;
+ 
+ 	memset(sndev->self_shared, 0, LUT_SIZE);
++#ifndef CONFIG_NTB_LINK_MGMT
+ 	sndev->self_shared->magic = SWITCHTEC_NTB_MAGIC;
++#endif
+ 	sndev->self_shared->partition_id = sndev->stdev->partition;
+ 
+ 	for (i = 0; i < sndev->nr_direct_mw; i++) {
+@@ -1036,6 +1103,159 @@ static void switchtec_ntb_deinit_shared_mw(struct switchtec_ntb *sndev)
+ 				  sndev->self_shared_dma);
+ }
+ 
++
++#ifdef CONFIG_NTB_LINK_MGMT
++static irqreturn_t switchtec_isr(int irq, void *dev)
++{
++	struct switchtec_ntb *sndev = dev;
++	int i = 0;
++
++	for (i = DB_START_VEC; i <= DB_END_VEC; i++) {
++		if (irq == sndev->irqs[i].irq_num) {
++			dev_dbg(&sndev->stdev->dev,
++				"doorbell: (%d)\n", (i - DB_START_VEC));
++			ntb_db_event(&sndev->ntb, (i - DB_START_VEC));
++			return IRQ_HANDLED;
++		}
++	}
++
++	/* we do not read message register to know the message type:
++	 * UP/DOWN/FORCE_DOWN as we avoid reading over PCIe by CPU.
++	 * Trust the remote to use the correct message register.
++	 * FORCE_LINK_DOWN must not use same register as LINK_UP.
++	 */
++
++	if (irq == sndev->irqs[LINK_UP_VEC].irq_num) {
++		sndev->link_is_up = 1;
++		dev_dbg(&sndev->stdev->dev, "ntb link up");
++		iowrite8(1, &sndev->mmio_self_dbmsg->imsg[MSG_REG_1].status);
++		switchtec_ntb_set_link_speed(sndev);
++		ntb_link_event(&sndev->ntb);
++
++		return IRQ_HANDLED;
++	}
++
++	if (irq == sndev->irqs[LINK_DOWN_VEC].irq_num) {
++		sndev->link_is_up = 0;
++		dev_dbg(&sndev->stdev->dev, "ntb link down");
++		iowrite8(1, &sndev->mmio_self_dbmsg->imsg[MSG_REG_2].status);
++		switchtec_ntb_set_link_speed(sndev);
++		ntb_link_event(&sndev->ntb);
++
++		return IRQ_HANDLED;
++	}
++
++	return IRQ_HANDLED;
++}
++
++static void switchtec_ntb_deinit_db_msg_irq(struct switchtec_ntb *sndev)
++{
++	int i = 0;
++
++	for (i = LINK_DOWN_VEC; i < MAXIMUM_VEC; i++) {
++		if (sndev->irqs[i].isr_attached) {
++			free_irq(sndev->irqs[i].irq_num, sndev);
++			sndev->irqs[i].isr_attached = false;
++			sndev->irqs[i].irq_num = 0;
++		}
++	}
++}
++
++static int switchtec_ntb_init_db_msg_irq(struct switchtec_ntb *sndev)
++{
++	int i;
++	int rc;
++	int event_irq;
++	uint32_t bit;
++	int idb_vecs = sizeof(sndev->mmio_self_dbmsg->idb_vec_map);
++
++	event_irq = ioread32(&sndev->stdev->mmio_part_cfg->vep_vector_number);
++
++	/**
++	 * Initalize vector number to be used for each DB and message register.
++	 */
++	for (i = 0; i < ((idb_vecs/2) - 4); i++) {
++		 iowrite8((i + DB_START_VEC),
++				&sndev->mmio_self_dbmsg->idb_vec_map[i]);
++	}
++
++	/* TODO we are leaving 4 db here as each partition using only 28 db's.
++	 * Though i feel each partition can use 30 db's. out of 64, 4 are
++	 * reserved for message registers and rest are free for db. so 60 can
++	 * be divided between both partitions. for message resgister mmap is
++	 * there which helps using same index in both partitions. It was same
++	 * earlier as well. though its only theoritical understanding and yet
++	 * to verify. Hence not touching current logic of db and message mgmt.
++	 */
++	for (i = (idb_vecs/2); i < (idb_vecs - 4); i++) {
++		iowrite8(((i - (idb_vecs/2)) + DB_START_VEC),
++				&sndev->mmio_self_dbmsg->idb_vec_map[i]);
++	}
++
++	iowrite8(LINK_UP_VEC, &sndev->mmio_self_dbmsg->idb_vec_map[i++]);
++	iowrite8(LINK_DOWN_VEC, &sndev->mmio_self_dbmsg->idb_vec_map[i++]);
++
++	for (; i < idb_vecs; i++)
++		iowrite8(MAXIMUM_VEC, &sndev->mmio_self_dbmsg->idb_vec_map[i]);
++
++	dev_dbg(&sndev->stdev->dev,
++		"irqs - event: %d, db: [%d-%d], msgs: [%d-%d]",
++		event_irq, DB_START_VEC, DB_END_VEC,
++		LINK_DOWN_VEC, LINK_UP_VEC);
++
++	/**
++	 * Attach ISR for :-
++	 * Message Register 1 to be used for NTB link up.
++	 * Message Register 2 to be used for NTB link down.
++	 * To all allowed doorbells.
++	 */
++	sndev->irqs[LINK_UP_VEC].irq_num =
++				pci_irq_vector(sndev->stdev->pdev, LINK_UP_VEC);
++	rc = request_irq(sndev->irqs[LINK_UP_VEC].irq_num, switchtec_isr, 0,
++						"switchtec_link_up_msg", sndev);
++	if (rc) {
++		goto deinit_db_msg_irq;
++	} else {
++		sndev->irqs[LINK_UP_VEC].isr_attached = true;
++	}
++
++	sndev->irqs[LINK_DOWN_VEC].irq_num =
++			      pci_irq_vector(sndev->stdev->pdev, LINK_DOWN_VEC);
++	rc = request_irq(sndev->irqs[LINK_DOWN_VEC].irq_num, switchtec_isr, 0,
++					      "switchtec_link_down_msg", sndev);
++	if (rc) {
++		goto deinit_db_msg_irq;
++	} else {
++		sndev->irqs[LINK_DOWN_VEC].isr_attached = true;
++	}
++
++	bit = 0;
++	for_each_set_bit(bit, (long unsigned int *)(&sndev->db_valid_mask),
++				 fls(ALLOWED_DB)) {
++		int idx = 0;
++		idx = (DB_START_VEC + bit);
++		sndev->irqs[idx].irq_num = pci_irq_vector(sndev->stdev->pdev,
++									 idx);
++		rc = request_irq(sndev->irqs[idx].irq_num, switchtec_isr, 0,
++					      "switchtec_doorbell", sndev);
++		if (rc) {
++			goto deinit_db_msg_irq;
++		} else {
++			sndev->irqs[idx].isr_attached = true;
++		}
++	}
++
++	dev_dbg(&sndev->stdev->dev, "Registered switchtec_isr for db and msg");
++
++	return rc;
++
++deinit_db_msg_irq:
++	switchtec_ntb_deinit_db_msg_irq(sndev);
++	return rc;
++}
++
++#else
++
+ static irqreturn_t switchtec_ntb_doorbell_isr(int irq, void *dev)
+ {
+ 	struct switchtec_ntb *sndev = dev;
+@@ -1121,6 +1341,7 @@ static void switchtec_ntb_deinit_db_msg_irq(struct switchtec_ntb *sndev)
+ 	free_irq(sndev->doorbell_irq, sndev);
+ 	free_irq(sndev->message_irq, sndev);
+ }
++#endif
+ 
+ static int switchtec_ntb_add(struct device *dev,
+ 			     struct class_interface *class_intf)
+diff --git a/drivers/ntb/test/ntb_tool.c b/drivers/ntb/test/ntb_tool.c
+index 91526a9..34cdc46 100644
+--- a/drivers/ntb/test/ntb_tool.c
++++ b/drivers/ntb/test/ntb_tool.c
+@@ -143,6 +143,9 @@ struct tool_ctx {
+ 	wait_queue_head_t link_wq;
+ 	int mw_count;
+ 	struct tool_mw mws[MAX_MWS];
++#ifdef CONFIG_NTB_LINK_MGMT
++	bool retrigger_link;
++#endif
+ };
+ 
+ #define SPAD_FNAME_SIZE 0x10
+@@ -166,6 +169,20 @@ static void tool_link_event(void *ctx)
+ 
+ 	up = ntb_link_is_up(tc->ntb, &speed, &width);
+ 
++#ifdef CONFIG_NTB_LINK_MGMT
++	if (up) {
++		if (tc->retrigger_link) {
++			/* only once for every link up.*/
++			ntb_link_enable(tc->ntb, NTB_SPEED_AUTO,
++							 NTB_WIDTH_AUTO);
++			tc->retrigger_link = false;
++		}
++	} else {
++		/* link is down, we will have to do re-trigger on up.*/
++	        tc->retrigger_link = true;
++	}
++#endif
++
+ 	dev_dbg(&tc->ntb->dev, "link is %s speed %d width %d\n",
+ 		up ? "up" : "down", speed, width);
+ 
+@@ -957,6 +974,9 @@ static int tool_probe(struct ntb_client *self, struct ntb_dev *ntb)
+ 	}
+ 
+ 	tc->ntb = ntb;
++#ifdef CONFIG_NTB_LINK_MGMT
++        tc->retrigger_link = true;
++#endif
+ 	init_waitqueue_head(&tc->link_wq);
+ 
+ 	tc->mw_count = min(ntb_peer_mw_count(tc->ntb), MAX_MWS);
+diff --git a/drivers/pci/switch/switchtec.c b/drivers/pci/switch/switchtec.c
+index 730cc89..762ad9b 100644
+--- a/drivers/pci/switch/switchtec.c
++++ b/drivers/pci/switch/switchtec.c
+@@ -1185,8 +1185,19 @@ static int switchtec_init_isr(struct switchtec_dev *stdev)
+ 	int nvecs;
+ 	int event_irq;
+ 
++#ifdef CONFIG_NTB_LINK_MGMT
++	if (stdev->mmio_sys_info->device_id != 0x8534) {
++		nvecs = pci_alloc_irq_vectors(stdev->pdev, 1, 4,
++					      PCI_IRQ_MSIX | PCI_IRQ_MSI);
++	} else {
++		/* 1 MSI-X per NTB DB/MSG. - NVIDIA*/
++		nvecs = pci_alloc_irq_vectors(stdev->pdev, 32, 32,
++					      PCI_IRQ_MSIX | PCI_IRQ_MSI);
++	}
++#else
+ 	nvecs = pci_alloc_irq_vectors(stdev->pdev, 1, 4,
+ 				      PCI_IRQ_MSIX | PCI_IRQ_MSI);
++#endif
+ 	if (nvecs < 0)
+ 		return nvecs;
+ 
