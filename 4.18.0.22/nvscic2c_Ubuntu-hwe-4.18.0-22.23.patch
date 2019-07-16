@@ -1,0 +1,4633 @@
+diff --git a/drivers/misc/Kconfig b/drivers/misc/Kconfig
+index 3726eac..0aec171 100644
+--- a/drivers/misc/Kconfig
++++ b/drivers/misc/Kconfig
+@@ -527,4 +527,5 @@ source "drivers/misc/echo/Kconfig"
+ source "drivers/misc/cxl/Kconfig"
+ source "drivers/misc/ocxl/Kconfig"
+ source "drivers/misc/cardreader/Kconfig"
++source "drivers/misc/nvscic2c/Kconfig"
+ endmenu
+diff --git a/drivers/misc/Makefile b/drivers/misc/Makefile
+index af22bbc..e917a76 100644
+--- a/drivers/misc/Makefile
++++ b/drivers/misc/Makefile
+@@ -58,3 +58,4 @@ obj-$(CONFIG_ASPEED_LPC_SNOOP)	+= aspeed-lpc-snoop.o
+ obj-$(CONFIG_PCI_ENDPOINT_TEST)	+= pci_endpoint_test.o
+ obj-$(CONFIG_OCXL)		+= ocxl/
+ obj-$(CONFIG_MISC_RTSX)		+= cardreader/
++obj-$(CONFIG_NVSCIC2C)		+= nvscic2c/
+diff --git a/drivers/misc/nvscic2c/Kconfig b/drivers/misc/nvscic2c/Kconfig
+new file mode 100644
+index 0000000..8de3534
+--- /dev/null
++++ b/drivers/misc/nvscic2c/Kconfig
+@@ -0,0 +1,31 @@
++if X86_64
++config NVSCIC2C
++	tristate "Enable Nvidia Host-to-Host data transfer over PCIe-NTB module"
++	depends on NTB && NTB_SWITCHTEC
++	select NTB_LINK_MGMT
++	default n
++	help
++	 This enables SoftwareCommunicationInterface for Host-to-Host
++	 communication over PCIe. This is possible only via NTB at the
++	 moment and for the MicroSemi/MicroChip PM8534 switch with NTB
++	 vEPs. We also enable the NTB link management that is introduced
++	 by NVIDIA Corp Ltd. to not make PCIe Rd by CPU to detect remote
++	 link UP.
++	 If unsure, Please say N.
++endif
++
++if ARCH_TEGRA
++config NVSCIC2C
++	tristate "Enable Nvidia Host-to-Host data transfer over PCIe-NTB module"
++	depends on NTB && ARCH_TEGRA_19x_SOC
++	select NTB_LINK_MGMT
++	help
++	 This enables SoftwareCommunicationInterface for Host-to-Host
++	 communication over PCIe. This is possible only via NTB at the
++	 moment and for the MicroSemi/MicroChip PM8534 switch with NTB
++	 vEPs. We also enable the NTB link management that is introduced
++	 by NVIDIA Corp Ltd. to not make PCIe Rd by CPU to detect remote
++	 link UP.
++	 If unsure, Please say N.
++endif
++# removed NTB_SWITCHTEC for tegra on k-4.9
+diff --git a/drivers/misc/nvscic2c/Makefile b/drivers/misc/nvscic2c/Makefile
+new file mode 100644
+index 0000000..65a6c1c
+--- /dev/null
++++ b/drivers/misc/nvscic2c/Makefile
+@@ -0,0 +1,24 @@
++#
++# drivers/misc/nvsci-c2c-x86/Makefile
++#
++# This program is free software; you can redistribute it and/or modify it
++# under the terms and conditions of the GNU General Public License,
++# version 2, as published by the Free Software Foundation.
++#
++# This program is distributed in the hope it will be useful, but WITHOUT
++# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
++# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for
++# more details.
++#
++# Copyright (c) 2019, NVIDIA CORPORATION.  All rights reserved.
++#
++
++ccflags-y += -Werror
++obj-$(CONFIG_NVSCIC2C)		+= nvscic2c.o
++nvscic2c-objs			+= channel-cdev.o \
++				   channel-ops.o  \
++				   config.o       \
++				   link-mgmt.o    \
++				   module.o       \
++				   ntb-client.o
++nvscic2c-$(CONFIG_DEBUG_FS)	+= channel-dbgfs.o
+diff --git a/drivers/misc/nvscic2c/channel-cdev.c b/drivers/misc/nvscic2c/channel-cdev.c
+new file mode 100644
+index 0000000..b312acbd
+--- /dev/null
++++ b/drivers/misc/nvscic2c/channel-cdev.c
+@@ -0,0 +1,860 @@
++/*
++ * Copyright (c) 2019, NVIDIA CORPORATION.  All rights reserved.
++ *
++ * This program is free software; you can redistribute it and/or modify it
++ * under the terms and conditions of the GNU General Public License,
++ * version 2, as published by the Free Software Foundation.
++ *
++ * This program is distributed in the hope it will be useful, but WITHOUT
++ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
++ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for
++ * more details.
++ */
++
++#include "channel.h"
++#include "chip-to-chip.h"
++#include <linux/nvscic2c-ioctl.h>
++#include <linux/types.h>
++#include <linux/errno.h>
++#include <linux/slab.h>
++#include <linux/kernel.h>
++#include <linux/wait.h>
++#include <linux/cdev.h>
++#include <linux/poll.h>
++#include <linux/device.h>
++#include <linux/mm.h>
++#include <linux/printk.h>
++
++
++/*
++ * Deals with Chip-To-Chip channel devices.
++ * - creating char devices for each nvscic2c channel
++ * - implement the fops: open(), close(), mmap(), poll(), ioctl().
++ * - We shall not support Read, Write from User space for this device
++ * - Every channel also has a chunk of Self(Rx) and Peer(Tx) memory
++ *   across PCIe.
++ * - Every channel also allocates a private memory exposed to user-space
++ *   but not across PCIe.
++ */
++
++/* prototype.*/
++static int ioctl_get_info_impl(struct channel_t *channel,
++				 struct nvscic2c_info *get_info);
++
++/* prototype.*/
++static int ioctl_notify_remote_impl(struct channel_t *channel,
++					uint8_t *db_bits);
++
++/* prototype.*/
++static int update_db_ch_tbl(struct channel_drv_ctx_t *ch_drv_ctx,
++				struct channel_t *channel, bool add);
++
++
++/* Channel cdev context. If not making it global here, add it to c2c_drv_ctx.*/
++static struct channel_drv_ctx_t *ch_drv_ctx;
++
++
++/*
++ * open() syscall backing for nvscic2c channel devices.
++ *
++ * We do not allow same channel to be opened more than once on the lines of
++ * ivc/ivm mempools.
++ *
++ * Populate the channel_device internal data-structure into fops private data
++ * for subsequent calls to other fops handlers.
++ */
++static int channel_fops_open(struct inode *inode, struct file *filp)
++{
++	int ret = 0;
++	struct channel_t *channel =
++		container_of(inode->i_cdev, struct channel_t, cdev);
++
++	mutex_lock(&(channel->fops_lock));
++	if (channel->in_use) {
++		/* already in use.*/
++		ret = -EBUSY;
++	} else {
++		channel->in_use = true;
++	}
++	mutex_unlock(&(channel->fops_lock));
++
++	/* propagate link and state change events that occur after the device
++	 * is opened and not the stale ones.
++	 */
++	atomic_set(&(channel->db_event), 0);
++	atomic_set(&(channel->link_change_event), 0);
++
++	filp->private_data = channel;
++	return ret;
++}
++
++
++/* close() syscall backing for nvscic2c channel devices.*/
++static int channel_fops_release(struct inode *inode, struct file *filp)
++{
++	int ret = 0;
++	struct channel_t *channel = filp->private_data;
++
++	if (WARN_ON(!(channel != NULL)))
++		return -EFAULT;
++
++	mutex_lock(&(channel->fops_lock));
++	if (channel->in_use)
++		channel->in_use = false;
++	mutex_unlock(&(channel->fops_lock));
++
++	filp->private_data = NULL;
++	return ret;
++}
++
++
++/*
++ * mmap() syscall backing for nvscic2c channel devices.
++ *
++ * We support mapping Four distinct regions of memory that each nvscic2c
++ * channel owns to user-space:
++ * - Peer's memory for same channel(used for Tx),
++ * - Self's memory (used for Rx),
++ * - Self Private memory(not exposed to Peer).
++ * - NTB link control memory(common to all channels).
++ * We map just one segment of memory in each call based on the information
++ * (which memory segment) provided by user-space code.
++ *
++ * We have added a strict check which makes user-space SW map area of memory
++ * which we exported, if user-space SW wanted to map little of it (but starting
++ * from base offset: 0 allow by relaxing the check in the function below.
++ */
++static int channel_fops_mmap(struct file *filp, struct vm_area_struct *vma)
++{
++	int ret = 0;
++	uint64_t mmap_type = vma->vm_pgoff;
++	uint64_t memaddr = 0x0;
++	uint64_t memsize = 0x0;
++	struct channel_t *channel = filp->private_data;
++
++	if (WARN_ON(!(channel != NULL)))
++		return -EFAULT;
++
++	if (WARN_ON(!(vma != NULL)))
++		return -EFAULT;
++
++	mutex_lock(&(channel->fops_lock));
++
++	switch (mmap_type) {
++	case PEER_MEM_MMAP:
++		vma->vm_page_prot = pgprot_noncached(vma->vm_page_prot);
++		memaddr = channel->tx_mem.aper;
++		memsize = channel->tx_mem.size;
++		break;
++	case SELF_MEM_MMAP:
++		memsize = channel->rx_mem.size;
++		break;
++	case CTRL_MEM_MMAP:
++		memaddr = channel->ctrl_mem.phys_addr;
++		memsize = channel->ctrl_mem.size;
++		break;
++	case LINK_MEM_MMAP:
++		if (vma->vm_flags & VM_WRITE) {
++			ret = -EPERM;
++			goto exit;
++		}
++		memsize = link_mgmt_get_status_mem_size();
++		break;
++	default:
++		ERR("(%s): unrecognised mmap type: (%llu)\n",
++			channel->name, mmap_type);
++		goto exit;
++	}
++
++	if ((vma->vm_end - vma->vm_start) != memsize) {
++		ERR("(%s): mmap type: (%llu), memsize mismatch\n",
++			channel->name, mmap_type);
++		goto exit;
++	}
++
++	vma->vm_pgoff     = 0;
++	vma->vm_flags     |= (VM_DONTCOPY); // fork() not supported.
++	switch (mmap_type) {
++	case SELF_MEM_MMAP:
++		/* becuse channel doesn't have ntbdev to mmap in case
++		 * memory was allocated via dma_alloc_coherent().
++		 */
++		ret = ntb_client_mmap_self_mem(vma, &(channel->rx_mem));
++		break;
++	case LINK_MEM_MMAP:
++		/* becuse link mgmt is an abstraction and we haven't
++		 * memcopied the link status mem info with channel.
++		 */
++		ret = link_mgmt_mmap_status_mem(vma);
++		break;
++	default:
++		ret = remap_pfn_range(vma, vma->vm_start,
++				      PFN_DOWN(memaddr),
++				      memsize, vma->vm_page_prot);
++		break;
++	}
++	if (ret) {
++		ERR("(%s): mmap() failed, mmap type:(%llu)\n",
++			channel->name, mmap_type);
++	}
++exit:
++	mutex_unlock(&(channel->fops_lock));
++	return ret;
++}
++
++
++/*
++ * poll() syscall backing for nvscic2c channel devices.
++ *
++ * user-space code shall call poll with FD on read, write and probably exception
++ * for channel state changes.
++ *
++ * If we are able to read(), write() or there is a pending state change event
++ * to be serviced, we return letting application call get_event(), otherwise
++ * kernel f/w will wait for waitq activity to occur.
++ */
++static unsigned int channel_fops_poll(struct file *filp, poll_table *wait)
++{
++	int ret = 0;
++	struct channel_t *channel = filp->private_data;
++
++	if (WARN_ON(!(channel != NULL)))
++		return -EFAULT;
++
++	mutex_lock(&(channel->fops_lock));
++
++	/* add all waitq if they are different for read, write & link+state.*/
++	poll_wait(filp, &(channel->waitq), wait);
++
++	/* wake up read, write (& exception - those who want to use) fd on
++	 * getting link+state change event.
++	 */
++	if (atomic_read(&(channel->link_change_event))) {
++		/* Pending link event. */
++		atomic_dec(&channel->link_change_event);
++		ret = (POLLPRI | POLLIN | POLLOUT);
++	} else if (atomic_read(&(channel->db_event))) {
++		/* Pending doorbell events from remote. */
++		atomic_dec(&channel->db_event);
++		ret = (POLLPRI | POLLIN | POLLOUT);
++	}
++
++	mutex_unlock(&(channel->fops_lock));
++	return ret;
++}
++
++
++/*
++ * ioctl() syscall backing for nvscic2c channel devices.
++ *
++ * We expose ioctls() for:
++ * - Passing all the memory segments information to user in one ioctl call.
++ * - user can notify Peer via an ioctl() call.
++ */
++static long channel_fops_ioctl(struct file *filp, unsigned int cmd,
++		unsigned long arg)
++{
++	int ret = 0;
++	uint8_t buf[256] = {0};
++	struct channel_t *channel = filp->private_data;
++
++	if (WARN_ON(!(channel != NULL)))
++		return -EFAULT;
++
++	/* validate the cmd */
++	if ((_IOC_TYPE(cmd) != NVSCIC2C_IOCTL_MAGIC) ||
++		(_IOC_NR(cmd) == 0) ||
++		(_IOC_NR(cmd) > NVSCIC2C_IOCTL_NUMBER_MAX) ||
++		(_IOC_SIZE(cmd) > 256)) {
++		ERR("(%s): Incorrect ioctl cmd/cmd params/magic\n",
++			channel->name);
++		return -ENOTTY;
++	}
++
++	/* copy the cmd if it was meant from user->kernel: notify_remote.*/
++	(void) memset(buf, 0, sizeof(buf));
++	if (_IOC_DIR(cmd) & _IOC_WRITE) {
++		if (copy_from_user(buf, (void __user *)arg, _IOC_SIZE(cmd)))
++			return -EFAULT;
++	}
++
++	switch (cmd) {
++	case NVSCIC2C_IOCTL_GET_INFO:
++		ret = ioctl_get_info_impl(channel,
++			(struct nvscic2c_info *) buf);
++		break;
++	case NVSCIC2C_IOCTL_NOTIFY_REMOTE:
++		ret = ioctl_notify_remote_impl(channel, (uint8_t *)buf);
++		break;
++	default:
++		ERR("(%s): unrecognised nvscic2c ioclt cmd: 0x%x\n",
++			channel->name, cmd);
++		ret = -ENOTTY;
++		break;
++	}
++
++	/* copy the cmd result back to user if it was kernel->user: get_info.*/
++	if ((ret == 0) && (_IOC_DIR(cmd) & _IOC_READ))
++		ret = copy_to_user((void __user *)arg, buf, _IOC_SIZE(cmd));
++
++	return ret;
++}
++
++
++/*
++ * set of channel file operations for each nvscic2c channel.
++ * We do not support: read() and write() on nvscic2c channel
++ * descriptors.
++ */
++static const struct file_operations channel_fops = {
++	.owner          = THIS_MODULE,
++	.open           = channel_fops_open,
++	.release        = channel_fops_release,
++	.mmap           = channel_fops_mmap,
++	.unlocked_ioctl = channel_fops_ioctl,
++	.poll           = channel_fops_poll,
++	.llseek         = noop_llseek,
++};
++
++
++/*
++ * helper function to implement NVSCIC2C_IOCTL_GET_INFO ioctl call.
++ *
++ * All important channel dev node properites required for user-space
++ * to map the channel memory and work without going to LKM for data
++ * xfer are exported in this ioctl implementation.
++ *
++ * Because we export 4 different memory for a single nvscic2c channel
++ * device, export the memory regions as masked offsets.
++ */
++static int ioctl_get_info_impl(struct channel_t *channel,
++				 struct nvscic2c_info *get_info)
++{
++	/* actual offsets of 3 mem are not shared as we have to support
++	 * multiple mmap for a single nvscic2c char device.
++	 */
++	get_info->nframes     = channel->nframes;
++	get_info->frame_sz    = channel->frame_sz;
++	get_info->xfer_type   = channel->bulk_xfer_mode;
++	get_info->peer.offset = (PEER_MEM_MMAP << PAGE_SHIFT);
++	get_info->peer.size   = channel->tx_mem.size;
++	get_info->self.offset = (SELF_MEM_MMAP << PAGE_SHIFT);
++	get_info->self.size   = channel->rx_mem.size;
++	get_info->ctrl.offset = (CTRL_MEM_MMAP << PAGE_SHIFT);
++	get_info->ctrl.size   = channel->ctrl_mem.size;
++	get_info->link.offset = (LINK_MEM_MMAP << PAGE_SHIFT);
++	get_info->link.size   = link_mgmt_get_status_mem_size();
++	// FIXME: remove this platform, added for unit testing.
++#if   defined(CONFIG_ARCH_TEGRA)
++	strcpy(get_info->platform, "tegra-umd");
++#elif defined(CONFIG_X86_64)
++	strcpy(get_info->platform, "x86-umd");
++#endif
++	return 0;
++}
++
++
++/*
++ * helper function to implement NVSCIC2C_IOCTL_NOTIFY_REMOTE ioctl call.
++ *
++ * like bulk xfer channels, where all DBs are not in use, we check if
++ * user-space SW asked to trigger a DB which the channel device has not
++ * configured, raise error.
++ *
++ * Otherwise, triggr peer DB ids by inferencing the mask user-space SW
++ * passed in argument and return the result.
++ */
++static int ioctl_notify_remote_impl(struct channel_t *channel,
++					uint8_t *db_bits)
++{
++	uint64_t set_db_bits = 0x0;
++	int ret = 0;
++
++	if ((*db_bits) & (NVSCIC2C_NOTIFY_PRODUCER)) {
++		if (channel->prod_event_id == DB_ID_NIL) {
++			ERR("(%s): Prod DB idx unavailable\n",
++				channel->name);
++			return -EINVAL;
++		}
++		set_db_bits |= (1 << channel->prod_event_id);
++	} else if ((*db_bits) & (NVSCIC2C_NOTIFY_CONSUMER)) {
++		if (channel->cons_event_id == DB_ID_NIL) {
++			ERR("(%s): Cons DB idx unavailable\n",
++				channel->name);
++			return -EINVAL;
++		}
++		set_db_bits |= (1 << channel->cons_event_id);
++	} else if ((*db_bits) & (NVSCIC2C_NOTIFY_STATE)) {
++		if (channel->state_event_id == DB_ID_NIL) {
++			ERR("(%s): State DB idx unavailable\n",
++				channel->name);
++			return -EINVAL;
++		}
++		set_db_bits |= (1 << channel->state_event_id);
++	} else {
++		ERR("(%s): unrecognised notify remote ioctl cmd arg: 0x%x\n",
++			channel->name, *db_bits);
++		return -EINVAL;
++	}
++
++	/* trigger the DB.*/
++	ret = ntb_client_peer_db_set(set_db_bits);
++	if (ret) {
++		ERR("(%s): Failed to trigger peer db(s):(0x%08llx)\n",
++			channel->name, set_db_bits);
++		return ret;
++	}
++
++	return 0;
++}
++
++
++/* Clean up the c2c channel devices. */
++static int remove_channel_device(struct channel_drv_ctx_t *ch_drv_ctx,
++					struct channel_t *channel)
++{
++	int ret = 0;
++
++	if ((!ch_drv_ctx)
++		|| (!channel)) {
++		return ret;
++	}
++
++#ifdef CONFIG_DEBUG_FS
++	channel_dbgfs_remove(channel);
++#endif
++
++	/* delink the channel DB associations.*/
++	update_db_ch_tbl(ch_drv_ctx, channel, false);
++
++	/* remove the channel device.*/
++	if (channel->device) {
++		cdev_del(&channel->cdev);
++		device_del(channel->device);
++		channel->device = NULL;
++	}
++
++	/* free the internal memory used for counter management.*/
++	channel_free(channel);
++
++	return ret;
++}
++
++
++/* Create the c2c channel devices for the user-space to:
++ * - Map the channel Self and Peer area.
++ * - send NTB DB notifications to remote/peer.
++ */
++static int add_channel_device(struct channel_drv_ctx_t *ch_drv_ctx,
++				struct channel_t *channel)
++{
++	int ret = 0;
++
++	/* basic validation.*/
++	if ((!ch_drv_ctx)
++		|| (!channel)) {
++		ret = -EINVAL;
++		ERR("(%s): Invalid Params\n", __func__);
++		goto err;
++	}
++
++	/* validate channel frames. As we map channel Rx and Tx to user-space,
++	 * this must happen on PAGE boundaries.
++	 */
++	ret = validate_channel_params(channel);
++	if (ret) {
++		ERR("Failed to validate channel parameters\n");
++		goto err;
++	}
++
++	/* parition the whole of Self and Peer memory into the channel
++	 * needs based on the frames/slots.
++	 */
++	ret = channel_alloc(channel,
++			    &(ch_drv_ctx->self_mem_base),
++			    &(ch_drv_ctx->peer_mem_base),
++			    &(ch_drv_ctx->running_off));
++	if (ret) {
++		ERR("(%s):Failed to allocate/initialise channel internals\n",
++			channel->name);
++		goto err;
++	}
++
++	/* create the nvscic2c channel device - interface for user-space sw.*/
++	channel->dev = MKDEV(MAJOR(ch_drv_ctx->char_dev), channel->minor);
++	cdev_init(&(channel->cdev), &(channel_fops));
++	channel->cdev.owner = THIS_MODULE;
++	ret = cdev_add(&(channel->cdev), channel->dev, 1);
++	if (ret != 0) {
++		ERR("(%s): cdev_add() failed\n", channel->name);
++		goto err;
++	}
++
++	/* parent is this hvd dev */
++	channel->device = device_create(ch_drv_ctx->class, NULL,
++					channel->dev, channel,
++					channel->name);
++	if (IS_ERR(channel->device)) {
++		ret = PTR_ERR(channel->device);
++		ERR("(%s): device_create() failed\n", channel->name);
++	}
++	dev_set_drvdata(channel->device, channel);
++
++	/* associate the NTB DB ids with the channel_device
++	 * This is for delivering DB notifications to this channel.
++	 * Enable those DBs too.
++	 */
++	ret = update_db_ch_tbl(ch_drv_ctx, channel, true);
++	if (ret) {
++		ERR("(%s): Failed to associate DB with channel\n",
++			 channel->name);
++		goto err;
++	}
++
++#ifdef CONFIG_DEBUG_FS
++	channel_dbgfs_create(channel);
++#endif
++
++	/* all okay.*/
++	return ret;
++
++err:
++	remove_channel_device(ch_drv_ctx, channel);
++	return ret;
++}
++
++
++/*
++ * Entry point for the nvscic2c channel char device sub-module/abstraction.
++ *
++ * On successful return (0), devices would have been created and ready to
++ * accept ioctls from user-space application.
++ *
++ * Mapping of each NTB doorbell to a C2C channel is also maintained here.
++ *
++ * We must come here after setting up the NTB client with PCIe shared memory
++ * (Self) and PCIe aperture(Peer) available.
++ */
++int channel_setup_devices(struct c2c_drv_ctx_t *drv_ctx)
++{
++	int ret = 0, i = 0;
++	struct channel_t *channel = NULL;
++	struct channel_param_t *param = NULL;
++
++	/* basic validation.*/
++	if ((!drv_ctx)
++		|| (!drv_ctx->c2c_param.channel_nr)) {
++		ret = -EINVAL;
++		ERR("(%s): Invalid Params\n", __func__);
++		goto err;
++	}
++
++	/* start by allocating the c2c channel driver ctx.*/
++	ch_drv_ctx = kzalloc(sizeof(*ch_drv_ctx), GFP_KERNEL);
++	if (!ch_drv_ctx) {
++		ret = -ENOMEM;
++		ERR("Failed to allocate channel driver ctx\n");
++		goto err;
++	}
++	ch_drv_ctx->channel_nr = drv_ctx->c2c_param.channel_nr;
++	memcpy(&(ch_drv_ctx->self_mem_base), &(drv_ctx->self_mem),
++					 sizeof(ch_drv_ctx->self_mem_base));
++	memcpy(&(ch_drv_ctx->peer_mem_base), &(drv_ctx->peer_mem),
++					 sizeof(ch_drv_ctx->peer_mem_base));
++
++	/* allocate the whole chardev range */
++	ret = alloc_chrdev_region(&(ch_drv_ctx->char_dev), 0,
++					ch_drv_ctx->channel_nr, MODULE_NAME);
++	if (ret < 0) {
++		ERR("(%s): alloc_chrdev_region() failed\n", __func__);
++		goto err;
++	}
++
++	ch_drv_ctx->class = class_create(THIS_MODULE, MODULE_NAME);
++	if (IS_ERR_OR_NULL(ch_drv_ctx->class)) {
++		ret = PTR_ERR(ch_drv_ctx->class);
++		ERR("Failed to create channel char class: %ld\n",
++						 PTR_ERR(ch_drv_ctx->class));
++		goto err;
++	}
++
++	/* allocate char devices context for supported channels.*/
++	ch_drv_ctx->channels = kzalloc((ch_drv_ctx->channel_nr *
++					sizeof(*ch_drv_ctx->channels)),
++					GFP_KERNEL);
++	if (!ch_drv_ctx->channels) {
++		ret = -ENOMEM;
++		ERR("Failed to allocate channel char devices array\n");
++		goto err;
++	}
++
++	/* create the NTB DB<->Channel association table.
++	 * start by querying the supported DB by NTB client.
++	 */
++	mutex_init(&ch_drv_ctx->db_ch_tbl_lock);
++	ch_drv_ctx->db_vec_nr = ntb_client_db_vector_count();
++	if (ch_drv_ctx->db_vec_nr <= 0) {
++		ret = -EINVAL;
++		ERR("NTB DB vector count:(%u) invalid\n",
++			ch_drv_ctx->db_vec_nr);
++		goto err;
++	}
++	DBG("NTB module has DB vecs:(%d)\n", ch_drv_ctx->db_vec_nr);
++
++	ch_drv_ctx->db_ch_tbl = kzalloc((ch_drv_ctx->db_vec_nr *
++					sizeof(struct channel_t *)),
++					GFP_KERNEL);
++	if (!ch_drv_ctx->db_ch_tbl) {
++		ret = -ENOMEM;
++		ERR("Failed to allocate NTB channel table\n");
++		goto err;
++	}
++
++	/* create char devices for each channel.*/
++	for (i = 0; i < ch_drv_ctx->channel_nr; i++) {
++		channel = &(ch_drv_ctx->channels[i]);
++		param   = &(drv_ctx->c2c_param.ch_params[i]);
++
++		/* copy the parameters from nvscic2c driver ctx.*/
++		channel->minor          = param->ch_id;
++		channel->event_type     = param->event_type;
++		channel->prod_event_id  = param->prod_event_id;
++		channel->cons_event_id  = param->cons_event_id;
++		channel->state_event_id = param->state_event_id;
++		channel->nframes        = param->nframes;
++		channel->frame_sz       = param->frame_sz;
++		channel->align          = param->align;
++		channel->bulk_xfer_mode = param->bulk_xfer_mode;
++		strcpy(channel->name, param->ch_name);
++
++		/* create nvscic2c channel device.*/
++		ret = add_channel_device(ch_drv_ctx, channel);
++		if (ret) {
++			ERR("Failed setting up nvscic2c device: (%s)\n",
++				channel->name);
++			goto err;
++		}
++	}
++
++	/* all okay.*/
++	return ret;
++
++err:
++	channel_release_devices(drv_ctx);
++	return ret;
++}
++
++
++/* exit point for nvscic2c channel char device sub-module/abstraction.*/
++int channel_release_devices(struct c2c_drv_ctx_t *drv_ctx)
++{
++	int ret = 0, i = 0;
++
++	if (!ch_drv_ctx)
++		return ret;
++
++	/* remove all the channel char devices.*/
++	if (ch_drv_ctx->channels) {
++		for (i = 0; i < ch_drv_ctx->channel_nr; i++) {
++			struct channel_t *channel = &(ch_drv_ctx->channels[i]);
++
++			remove_channel_device(ch_drv_ctx, channel);
++		}
++		kfree(ch_drv_ctx->channels);
++		ch_drv_ctx->channels = NULL;
++	}
++
++	kfree(ch_drv_ctx->db_ch_tbl);
++	ch_drv_ctx->db_ch_tbl = NULL;
++
++	mutex_destroy(&ch_drv_ctx->db_ch_tbl_lock);
++
++	if (ch_drv_ctx->class) {
++		class_destroy(ch_drv_ctx->class);
++		ch_drv_ctx->class = NULL;
++	}
++
++	if (ch_drv_ctx->char_dev) {
++		unregister_chrdev_region(ch_drv_ctx->char_dev,
++					ch_drv_ctx->channel_nr);
++		ch_drv_ctx->char_dev = 0;
++	}
++
++	kfree(ch_drv_ctx);
++	ch_drv_ctx = NULL;
++
++	return ret;
++}
++
++
++/*
++ * Function called by nvscic2c module.c on seeing a change in the
++ * NTB link status. Here we pass on this event to each channel
++ * which is required for their poll() implementation.
++ *
++ * This is supposed to be called only change in link status not
++ * for every NTB link event(hb).
++ */
++int channel_link_event(enum link_status status)
++{
++	int i = 0;
++	struct channel_t *channel = NULL;
++
++	if (!ch_drv_ctx) {
++		ERR("(%s): channel abstraction not ready yet\n", __func__);
++		return -EINVAL;
++	}
++
++	/* pass this event to all the channels. */
++	for (i = 0; i < ch_drv_ctx->channel_nr; i++) {
++		channel = &(ch_drv_ctx->channels[i]);
++
++		/* make poll() look at ntb link status again if waiting.*/
++		atomic_inc(&(channel->link_change_event));
++		wake_up_interruptible_all(&(channel->waitq));
++	}
++
++	return 0;
++}
++
++
++/*
++ * Function called by NTB client(ntb-client) on getting a NTB DB
++ * event.
++ *
++ * We receive the DB vector/index which triggered this event.
++ * We internally go through the channel and db association and
++ * pass on the db event to relevant channel.
++ *
++ * A channel will/may have multiple DB's but we should be get only
++ * 1 DB per event callback.
++ */
++int channel_db_event(int db_idx)
++{
++	struct channel_t *channel = NULL;
++
++	/* validate.*/
++	if (!ch_drv_ctx) {
++		ERR("(%s): channel abstraction not ready\n", __func__);
++		return -EINVAL;
++	}
++
++	/* validate.
++	 * we shall not read the db_mask on each call and verify if db was
++	 * enabled. If it wasn't db_ch_tbl will have NULL for it.
++	 */
++	if (db_idx >= ch_drv_ctx->db_vec_nr) {
++		ERR("%s): Unexpected DB vec received.\n", __func__);
++		return -EINVAL;
++	}
++
++	channel = ch_drv_ctx->db_ch_tbl[db_idx];
++	if (!channel) {
++		ERR("(%s): No channel is associated to db idx:(%d)\n",
++			__func__, db_idx);
++		return -EINVAL;
++	}
++
++	/* make poll() look at data counters or state change if waiting.*/
++	if ((channel->state_event_id == db_idx)
++			|| (channel->prod_event_id == db_idx)
++			|| (channel->cons_event_id == db_idx)) {
++		/* this is for channel state change event.*/
++		atomic_inc(&(channel->db_event));
++		wake_up_interruptible_all(&(channel->waitq));
++	}
++
++	return 0;
++}
++
++
++/*
++ * helper function to update the NTB doorbell and channel association
++ * for a single DB index.
++ *
++ * Will do nothing for DB which is beyond the supported DBs like (DB_ID_NIL).
++ *
++ * IMPORTATNT: must be called with lock held to serialise access to the
++ * table.
++ */
++static int update_db_ch_tbl_entry(struct channel_drv_ctx_t *ch_drv_ctx,
++				  uint8_t db_idx, struct channel_t *channel,
++				  bool add)
++{
++	int ret = 0;
++	struct channel_t *reg_ch = NULL;
++
++	/* checks for DB ids requested.
++	 * This covers the case for bulk channels, were db id can be DB_ID_NIL.
++	 */
++	if (db_idx < ch_drv_ctx->db_vec_nr) {
++		if (add) {
++			reg_ch = ch_drv_ctx->db_ch_tbl[db_idx];
++			if (reg_ch) {
++				ret = -EINVAL;
++				ERR("(%s): DB:(%d) pre-registered with: (%s)\n",
++					channel->name, db_idx,
++					reg_ch->name);
++			} else {
++				ret = ntb_client_db_clear((1 << db_idx));
++				ret |= ntb_client_db_clear_mask((1 << db_idx));
++				if (ret) {
++					ERR("(%s): Err enabling NTB DB: (%d)\n",
++						channel->name, db_idx);
++				} else {
++					ch_drv_ctx->db_ch_tbl[db_idx] = channel;
++				}
++			}
++		} else {
++			ntb_client_db_set_mask((1 << db_idx));
++			ntb_client_db_clear((1 << db_idx));
++			ch_drv_ctx->db_ch_tbl[db_idx]  = NULL;
++		}
++	} else if ((db_idx != DB_ID_NIL)
++			&& (add)) {
++		/* all DB's other than DB_ID_NIL(invalid for bulk channels).
++		 * return error only for addition.
++		 */
++		ret = -EINVAL;
++		ERR("(%s): DB idx:(%d) un-supported. Supported DB idx:[0-%d]\n",
++				channel->name, db_idx,
++				(ch_drv_ctx->db_vec_nr - 1));
++	}
++
++	return ret;
++}
++
++
++/*
++ * To maintain an association of NTB doorbell and channels,
++ * This is required when we get any notification callback via NTB DB vector
++ * to identify which channel it belongs to. Therefore, DB must be associated
++ * to one channel, although a channel may have multiple DBs.
++ *
++ * We must come here after having queried the NTB driver for supported DBs.
++ */
++static int update_db_ch_tbl(struct channel_drv_ctx_t *ch_drv_ctx,
++				struct channel_t *channel, bool add)
++{
++	int ret = 0;
++
++	/* basic validation.*/
++	if ((!ch_drv_ctx)
++		|| (!channel)) {
++		ret = -EINVAL;
++		ERR("(%s): Invalid Params\n", __func__);
++		goto err;
++	}
++
++	mutex_lock(&(ch_drv_ctx->db_ch_tbl_lock));
++	ret = update_db_ch_tbl_entry(ch_drv_ctx,
++			 channel->prod_event_id, channel, add);
++	ret |= update_db_ch_tbl_entry(ch_drv_ctx,
++			 channel->cons_event_id, channel, add);
++	ret |= update_db_ch_tbl_entry(ch_drv_ctx,
++			 channel->state_event_id, channel, add);
++	mutex_unlock(&(ch_drv_ctx->db_ch_tbl_lock));
++
++err:
++	return ret;
++}
+diff --git a/drivers/misc/nvscic2c/channel-dbgfs.c b/drivers/misc/nvscic2c/channel-dbgfs.c
+new file mode 100644
+index 0000000..9cd5779
+--- /dev/null
++++ b/drivers/misc/nvscic2c/channel-dbgfs.c
+@@ -0,0 +1,518 @@
++/*
++ * Copyright (c) 2019, NVIDIA CORPORATION.  All rights reserved.
++ *
++ * This program is free software; you can redistribute it and/or modify it
++ * under the terms and conditions of the GNU General Public License,
++ * version 2, as published by the Free Software Foundation.
++ *
++ * This program is distributed in the hope it will be useful, but WITHOUT
++ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
++ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for
++ * more details.
++ */
++
++#include "channel.h"
++#include "chip-to-chip.h"
++#include <linux/types.h>
++#include <linux/errno.h>
++#include <linux/kernel.h>
++#include <linux/device.h>
++#include <linux/slab.h>
++#include <linux/debugfs.h>
++#include <linux/random.h>
++#include <linux/io.h>
++
++
++/*
++ * This is sample dbgfs interface to test read/write from user-space to
++ * LKM for channel memories and vice-versa.
++ *
++ * This abstraction is not capable of handling LINK event changes and
++ * requires LINK_UP before memory region/read/write can start.
++ *
++ * The parameters: offset, ptich must be same across write and read runs
++ * across SoCs.
++ */
++
++
++/* aligned to 4.*/
++#define DATA_LEN		(1024)
++#define MAX_DATA_LEN		(PAGE_SIZE)
++#define DEFAULT_ITERATION	(512)
++
++/*
++ * packet header. Paylod follows immediately after this header.
++ */
++struct header_t {
++	/* sequence number. */
++	uint64_t seq;
++
++	/* length of data: DATA_LEN
++	 * written only during write.
++	 * Next packet starts at header+size.
++	 */
++	uint64_t size;
++};
++
++
++/*
++ * Helper function to make code concise and do the
++ * common validations applicable to all reaed/write
++ * file operations. Because we would write/read on Peer memory
++ * over PCIe, check for NTB link status.
++ */
++static int common_validations(struct channel_t *channel)
++{
++	/* if context/private driver data was valid. */
++	if (!channel) {
++		ERR("dbgfs: Channel drv. data NULL\n");
++		return -EINVAL;
++	}
++
++	if (!channel->tx_mem.pva) {
++		ERR("dbgfs: Local memory NULL\n");
++		return -EINVAL;
++	}
++
++	if (!channel->rx_mem.pva) {
++		ERR("dbgfs: Remote aperture NULL\n");
++		return -EINVAL;
++	}
++
++	if (!channel->ctrl_mem.pva) {
++		ERR("dbgfs: Remote aperture NULL\n");
++		return -EINVAL;
++	}
++
++	return 0;
++}
++
++
++static int write_mem(struct channel_t *channel, void *pva, size_t size,
++			bool iomem)
++{
++	off_t off = 0;
++	void *packet = NULL;
++	char *data = NULL;
++	uint32_t write = 0;
++	size_t packet_size = 0;
++	struct header_t *header = NULL;
++	struct header_t null_header = {0};
++#if   defined(CONFIG_ARCH_TEGRA)
++	char *platform = "tegra-lkm";
++#elif defined(CONFIG_X86_64)
++	char *platform = "x86-lkm";
++#endif
++
++	/* packet = header + data payload.*/
++	packet_size = sizeof(*header) + DATA_LEN;
++	packet = kzalloc(packet_size, GFP_KERNEL);
++	if (!packet)
++		return write;
++
++	header = (struct header_t *)(packet);
++	data   = (char *)(packet) + sizeof(*header);
++
++	/* we need space for one header(null/eos) also.*/
++	while (((off + packet_size) < (size - sizeof(*header)))
++		&& (write < channel->dbgfs_iteration)) {
++		/* packet header. */
++		header->seq  = write;
++		header->size = DATA_LEN;
++
++		/* packet data. */
++		snprintf(data, (DATA_LEN-1), "(%s): (%s): (%05u): (%lld)",
++			 platform, channel->name, write,
++			 ktime_to_ns(ktime_get()));
++
++		/* write.*/
++		if (iomem)
++			memcpy_toio((pva + off), packet, packet_size);
++		else
++			memcpy((pva + off), packet, packet_size);
++
++		write++;
++		off += packet_size;
++	}
++
++	/* write null packet.*/
++	null_header.seq  = write;
++	null_header.size = 0;
++	if (iomem) {
++		memcpy_toio((pva + off), &(null_header),
++				sizeof(null_header));
++	} else {
++		memcpy((pva + off), &(null_header),
++			sizeof(null_header));
++	}
++
++	kfree(packet);
++	return write;
++}
++
++
++static int read_mem(struct channel_t *channel, void *pva, size_t size,
++			bool iomem)
++{
++	off_t off = 0;
++	void *data = NULL;
++	uint32_t read = 0;
++	struct header_t header = {0};
++
++	/* maximum allocation.*/
++	data = kzalloc(MAX_DATA_LEN, GFP_KERNEL);
++	if (!data)
++		return read;
++
++	while (((off + sizeof(header)) < size)
++		&& (read < channel->dbgfs_iteration)) {
++		if (iomem) {
++			memcpy_fromio(&header, (pva + off), sizeof(header));
++			off += sizeof(header);
++			if ((header.size)
++				&& (header.size <= MAX_DATA_LEN)
++				&& ((off + header.size) < size)) {
++				memcpy_fromio(data, (pva + off), header.size);
++				off += header.size;
++			} else
++				break;
++		} else {
++			memcpy(&header, (pva + off), sizeof(header));
++			off += sizeof(header);
++			if ((header.size)
++				&& (header.size <= MAX_DATA_LEN)
++				&& ((off + header.size) < size)) {
++				memcpy(data, (pva + off), header.size);
++				off += header.size;
++			} else
++				break;
++		}
++		DBG("dbgfs: (%s): (%05llu): (%s)\n",
++			 channel->name, header.seq, (char *)data);
++		read++;
++	}
++
++	kfree(data);
++	return read;
++}
++
++
++/*
++ * Debugfs interface for user to issue write command that will
++ * go and touch self memory region for iterations times and write sample bytes.
++ */
++static int self_mem_write(void *data, u64 val)
++{
++	struct channel_t *channel = NULL;
++	int packets = 0;
++
++	channel = (struct channel_t *)(data);
++
++	if (common_validations(channel))
++		return -EINVAL;
++
++	DBG("dbgfs: (%s): writing self memory region\n", channel->name);
++	packets = write_mem(channel, channel->rx_mem.pva, channel->rx_mem.size,
++				false);
++	DBG("dbgfs: (%s): Write:(%d) packets on self memory region.\n",
++		channel->name, packets);
++
++	return 0;
++}
++
++
++/*
++ * Debugfs interface for user to issue read command that will
++ * go and read self memory region for iterations times and read the
++ * sample bytes.
++ */
++static int self_mem_read(void *data, u64 *val)
++{
++	struct channel_t *channel = NULL;
++	int packets = 0;
++
++	channel = (struct channel_t *)(data);
++
++	if (common_validations(channel))
++		return -EINVAL;
++
++	DBG("dbgfs: (%s): reading self memory region\n", channel->name);
++	packets = read_mem(channel, channel->rx_mem.pva, channel->rx_mem.size,
++				false);
++	DBG("dbgfs: (%s): Read:(%d) packets from self memory region.\n",
++		channel->name, packets);
++
++	*val = packets;
++	return 0;
++}
++
++
++/*
++ * Debugfs interface for user to issue write command that will
++ * go and touch Peer memory region for iterations times and write sample bytes.
++ */
++static int peer_mem_write(void *data, u64 val)
++{
++	struct channel_t *channel = NULL;
++	int packets = 0;
++
++	channel = (struct channel_t *)(data);
++
++	if (common_validations(channel))
++		return -EINVAL;
++
++	DBG("dbgfs: (%s): writing peer memory region\n", channel->name);
++	if (link_mgmt_get_link_status() != LINK_UP) {
++		INFO("dbgfs: (%s): Skipping write - NTB link not up.\n",
++			channel->name);
++	} else {
++		DBG("dbgfs: (%s): NTB link is UP\n", channel->name);
++		packets = write_mem(channel, channel->tx_mem.pva,
++					channel->tx_mem.size, true);
++		DBG("dbgfs: (%s): Write:(%d) packets on peer memory region.\n",
++			channel->name, packets);
++	}
++
++	return 0;
++}
++
++
++/*
++ * Debugfs interface for user to issue read command that will
++ * go and read Peer memory region for iterations times and read the
++ * sample bytes.
++ */
++static int peer_mem_read(void *data, u64 *val)
++{
++	struct channel_t *channel = NULL;
++	int packets = 0;
++
++	channel = (struct channel_t *)(data);
++
++	if (common_validations(channel))
++		return -EINVAL;
++
++	DBG("dbgfs: (%s): reading peer memory region\n", channel->name);
++	if (link_mgmt_get_link_status() != LINK_UP) {
++		INFO("dbgfs: (%s): Skipping read - NTB link not up.\n",
++			channel->name);
++	} else {
++		DBG("dbgfs: (%s): NTB link is UP\n", channel->name);
++		packets = read_mem(channel, channel->tx_mem.pva,
++					channel->tx_mem.size, true);
++		DBG("dbgfs: (%s): Read:(%d) packets from peer memory region.\n",
++			channel->name, packets);
++	}
++
++	*val = packets;
++	return 0;
++}
++
++
++/*
++ * Debugfs interface for user to issue write command that will
++ * go and touch ctrl memory region for iterations times and write sample bytes.
++ */
++static int ctrl_mem_write(void *data, u64 val)
++{
++	int packets = 0;
++	struct channel_t *channel = NULL;
++
++	channel = (struct channel_t *)(data);
++
++	if (common_validations(channel))
++		return -EINVAL;
++
++	DBG("dbgfs: (%s): writing ctrl memory region\n", channel->name);
++	packets = write_mem(channel, channel->ctrl_mem.pva,
++				 channel->ctrl_mem.size, false);
++	DBG("dbgfs: (%s): Write:(%d) packets on ctrl memory region.\n",
++		channel->name, packets);
++
++	return 0;
++}
++
++
++/*
++ * Debugfs interface for user to issue read command that will
++ * go and read ctrl memory region for iterations times and read the
++ * sample bytes.
++ */
++static int ctrl_mem_read(void *data, u64 *val)
++{
++	int packets = 0;
++	struct channel_t *channel = NULL;
++
++	channel = (struct channel_t *)(data);
++
++	if (common_validations(channel))
++		return -EINVAL;
++
++	DBG("dbgfs: (%s): reading ctrl memory region\n", channel->name);
++	packets = read_mem(channel, channel->ctrl_mem.pva,
++				channel->ctrl_mem.size,	false);
++	DBG("dbgfs: (%s): Read:(%d) packets from ctrl memory region.\n",
++		channel->name, packets);
++
++	*val = packets;
++	return 0;
++}
++
++
++
++/*
++ * Debugfs interface to set the number of iterations. Running for the entire
++ * memory window of self and peer can lead to lot of noise. User can use
++ * iterations to run through entire memory.
++ */
++static int set_iteration(void *data, u64 val)
++{
++	struct channel_t *channel = NULL;
++
++	channel = (struct channel_t *)(data);
++
++	if (common_validations(channel))
++		return -EINVAL;
++
++	if (val <= 0)
++		return -EINVAL;
++
++	channel->dbgfs_iteration = val;
++
++	return 0;
++}
++
++
++/*No use - added for completeness. */
++static int get_iteration(void *data, u64 *val)
++{
++	struct channel_t *channel = NULL;
++
++	channel = (struct channel_t *)(data);
++
++	if (common_validations(channel))
++		return -EINVAL;
++
++	*val = channel->dbgfs_iteration;
++	return 0;
++}
++
++DEFINE_SIMPLE_ATTRIBUTE(self_mem_fops, self_mem_read, self_mem_write, "%llu\n");
++DEFINE_SIMPLE_ATTRIBUTE(peer_mem_fops, peer_mem_read, peer_mem_write, "%llu\n");
++DEFINE_SIMPLE_ATTRIBUTE(ctrl_mem_fops, ctrl_mem_read, ctrl_mem_write, "%llu\n");
++DEFINE_SIMPLE_ATTRIBUTE(iteration_fops, get_iteration, set_iteration, "%llu\n");
++
++
++/*
++ * to clean up the debugfs interface.
++ */
++void channel_dbgfs_remove(struct channel_t *channel)
++{
++	if (channel) {
++		/* Remove the debugfs directory and it's files recursively. */
++		debugfs_remove_recursive(channel->dbgfs_root);
++		channel->dbgfs_root = NULL;
++		DBG("dbgfs: (%s) debug device removed\n", channel->name);
++	}
++}
++
++
++/*
++ * Helper API to create the Debugfs interface for each nvscic2c
++ * channel device and enable MANUAL VERFICATION of read/write from
++ * user-space to LKM and vice-versa for same memory: Peer(Tx), Self(Rx),
++ * Ctrl and Link.
++ *
++ * purely for debugging purpose.
++ */
++int channel_dbgfs_create(struct channel_t *channel)
++{
++	struct dentry *d = NULL;
++	size_t required_size = sizeof(struct header_t); // NULL header.
++
++	/* validation. */
++	if (!channel) {
++		ERR("dbgfs: Invalid params.\n");
++		return -EINVAL;
++	}
++
++	if (!debugfs_initialized()) {
++		ERR("dbgfs: Debugfs isn't initialised yet\n");
++		return -ENOTSUPP;
++	}
++
++	if ((sizeof(struct header_t) & 0x03)
++		|| (DATA_LEN & 0x03)) {
++		ERR("dbgfs: header must be 4 byte size aligned.\n");
++		return -EINVAL;
++	}
++
++
++	/* create parent debugfs directory under debugfs root file-system.*/
++	d = debugfs_create_dir(channel->name, NULL);
++	if (!d) {
++		ERR("dbgfs: Failed to create DebugFs root dir\n");
++		return -ENOMEM;
++	}
++
++	/* we need space for atleast one packet header(null/eos).*/
++	if (channel->ctrl_mem.size < required_size) {
++		ERR("dbgfs: Ctrl memory size less than required\n");
++		return -ENOMEM;
++	}
++	if (channel->tx_mem.size < required_size) {
++		ERR("dbgfs: Peer memory size less than required\n");
++		return -ENOMEM;
++	}
++	if (channel->rx_mem.size < required_size) {
++		ERR("dbgfs: Self memory size less than required\n");
++		return -ENOMEM;
++	}
++
++	channel->dbgfs_root      = d;
++	channel->dbgfs_iteration = DEFAULT_ITERATION;
++
++	/* create a file node to issue read/write across memories. */
++	d = debugfs_create_file("self_mem", 0664,
++				channel->dbgfs_root, channel,
++				&(self_mem_fops));
++	if (!d) {
++		ERR("dbgfs: verify debugfs intf failed\n");
++		goto err;
++	}
++	d = debugfs_create_file("peer_mem", 0664,
++				channel->dbgfs_root, channel,
++				&(peer_mem_fops));
++	if (!d) {
++		ERR("dbgfs: verify debugfs intf failed\n");
++		goto err;
++	}
++	d = debugfs_create_file("ctrl_mem", 0664,
++				channel->dbgfs_root, channel,
++				&(ctrl_mem_fops));
++	if (!d) {
++		ERR("dbgfs: verify debugfs intf failed\n");
++		goto err;
++	}
++
++	/* create a file node to set/query the starting offset for writing
++	 * sample bytes in all 3 memory regions.
++	 */
++	d = debugfs_create_file("iteartion", 0664,
++				channel->dbgfs_root, channel,
++				&(iteration_fops));
++	if (!d) {
++		ERR("dbgfs: offset debugfs intf failed\n");
++		goto err;
++	}
++
++	DBG("dbgfs: (%s) debug device created\n", channel->name);
++	return 0;
++
++err:
++	/* Remove the debugfs directory and it's files recursively. */
++	debugfs_remove_recursive(channel->dbgfs_root);
++	channel->dbgfs_root = NULL;
++
++	return -ENOMEM;
++}
+diff --git a/drivers/misc/nvscic2c/channel-ops.c b/drivers/misc/nvscic2c/channel-ops.c
+new file mode 100644
+index 0000000..77ae4ad
+--- /dev/null
++++ b/drivers/misc/nvscic2c/channel-ops.c
+@@ -0,0 +1,249 @@
++/*
++ * Copyright (c) 2019, NVIDIA CORPORATION.  All rights reserved.
++ *
++ * This program is free software; you can redistribute it and/or modify it
++ * under the terms and conditions of the GNU General Public License,
++ * version 2, as published by the Free Software Foundation.
++ *
++ * This program is distributed in the hope it will be useful, but WITHOUT
++ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
++ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for
++ * more details.
++ */
++
++#include "channel.h"
++#include "chip-to-chip.h"
++#include <linux/nvscic2c-ioctl.h>
++#include <linux/types.h>
++#include <linux/errno.h>
++#include <linux/slab.h>
++#include <linux/kernel.h>
++#include <linux/wait.h>
++#include <linux/cdev.h>
++#include <linux/poll.h>
++#include <linux/io.h>
++#include <linux/device.h>
++#include <linux/mm.h>
++
++
++/* prototype.*/
++static int
++validate_size(struct channel_t *channel,
++		struct dma_buff_t *self_mem_base,
++		struct pci_mmio_t *peer_mem_base,
++		size_t offset, size_t ch_sz);
++
++/* prototype. */
++static void print_channel_info(struct channel_t *channel);
++
++/*
++ * helper function to validate the nvscic2c channel parameters
++ * as parsed from config.c or DT.
++ */
++int validate_channel_params(struct channel_t *channel)
++{
++	int ret = -EINVAL;
++
++	/* valid entries for frames/slots of channel.*/
++	if ((!channel->nframes)
++		|| (!channel->frame_sz)) {
++		ERR("(%s): Invalid Channel frame properties\n",
++			channel->name);
++		goto err;
++	}
++
++	/* channel total mem footprint must be aligned to PAGE_SIZE
++	 * as we map channel's Peer and Self memories to user-space
++	 * on PAGE boundaries.
++	 */
++	if (channel->align & (~PAGE_MASK)) {
++		ERR("(%s): Alignment must be multiple of PAGE_SIZE:(0x%lx)\n",
++			channel->name, PAGE_SIZE);
++		goto err;
++	}
++
++	/* Each transfer unit across PCIe must be aligned to 4 bytes.*/
++	if (channel->frame_sz & (0x03U)) {
++		ERR("(%s): Channel frame size must be 4 byte aligned\n",
++			channel->name);
++		goto err;
++	}
++
++	/* all okay.*/
++	ret = 0;
++err:
++	return ret;
++}
++
++
++/*
++ * Allocate and initialise each nvscic2c channel internals with 3 different
++ * memories: Tx(PCIe Aperture), Rx (PCIe Shared Mem) and CtrlMem for maintaining
++ * control flow information not exposed to Peer.
++ *
++ * Fragment the nvscic2c memory: peer and self into channels starting
++ * at provided offset. Also, update the offset with the channel size
++ * requirements to be able to start next channel from there.
++ *
++ * Not thread-safe.
++ */
++int channel_alloc(struct channel_t *channel,
++		  struct dma_buff_t *self_mem_base,
++		  struct pci_mmio_t *peer_mem_base,
++		  off_t *curr_off)
++{
++	int ret = 0;
++	int ch_sz = 0;
++
++	/* arg checks. */
++	if ((!channel)
++		|| (!self_mem_base)
++		|| (!peer_mem_base)
++		|| (!curr_off)) {
++		ret = -EINVAL;
++		ERR("(%s): Invalid func argurments\n", __func__);
++		goto err;
++	}
++
++	/* initialise the channel device internals.*/
++	mutex_init(&(channel->fops_lock));
++	init_waitqueue_head(&(channel->waitq));
++	atomic_set(&(channel->db_event), 0);
++	atomic_set(&(channel->link_change_event), 0);
++
++	/* create a memory which is not exposed to Peer for the internal
++	 * counters for flow control logic. This memory shall also be mapped
++	 * by user: CTRL_MEM_MMAP. Therefore align to PAGE_SIZE.
++	 */
++	channel->ctrl_mem.size = CH_HDR_SIZE;
++	channel->ctrl_mem.size = PAGE_ALIGN(channel->ctrl_mem.size);
++	channel->ctrl_mem.pva  = kzalloc(channel->ctrl_mem.size, GFP_KERNEL);
++	if (!channel->ctrl_mem.pva) {
++		ret = -ENOMEM;
++		ERR("(%s): Failed to allocate priv. mem for control counters\n",
++			channel->name);
++		goto err;
++	}
++	channel->ctrl_mem.phys_addr = virt_to_phys(channel->ctrl_mem.pva);
++
++	/* calculate channel size: (Flow-Control Header Fields + Frames)
++	 * and alignement.
++	 */
++	ch_sz = ((channel->nframes * channel->frame_sz) + CH_HDR_SIZE);
++	ch_sz = ALIGN(ch_sz, channel->align);
++
++	/* check if we have enough space remaining in PCIe memory for ch_sz.
++	 * considering the allocations made for previous channels.
++	 */
++	ret = validate_size(channel, self_mem_base, peer_mem_base,
++				*curr_off, ch_sz);
++	if (ret) {
++		ERR("(%s): Channel size req. cannot fit in PCIe memory\n",
++			channel->name);
++		goto err;
++	}
++
++	/* assign the offsets within the base memory for this channel.
++	 * Since we are not creating kernel virtual mapping for these
++	 * memories we only fragment physical addresses.
++	 */
++	channel->tx_mem.aper = peer_mem_base->aper + *curr_off;
++	channel->tx_mem.size = ch_sz;
++
++	channel->rx_mem.dma_handle = self_mem_base->dma_handle + *curr_off;
++	channel->rx_mem.size = ch_sz;
++
++	/* debug only.*/
++	print_channel_info(channel);
++
++	/* all okay.*/
++	/* update the size of base mem used by this channel, used for next ch.*/
++	*curr_off += ch_sz;
++	return ret;
++
++err:
++	channel_free(channel);
++	return ret;
++}
++
++
++/* Free the resources made for the channel.
++ *
++ * Support for channel alloc()->channel free()->channel alloc() isn't there.
++ */
++int channel_free(struct channel_t *channel)
++{
++	int ret = 0;
++
++	if (channel) {
++		memset(&(channel->tx_mem), 0x0, sizeof(channel->tx_mem));
++		memset(&(channel->rx_mem), 0x0, sizeof(channel->tx_mem));
++
++		kfree(channel->ctrl_mem.pva);
++		memset(&(channel->ctrl_mem), 0x0, sizeof(channel->tx_mem));
++
++		mutex_destroy(&(channel->fops_lock));
++
++		/* how to retract running_off to previous value? */
++	}
++
++	return ret;
++}
++
++/*
++ * helper function to validate whether the channel size is within the
++ * range of PCIe shared memory/Aperture memory.
++ */
++static int
++validate_size(struct channel_t *channel,
++		struct dma_buff_t *self_mem_base,
++		struct pci_mmio_t *peer_mem_base,
++		size_t offset, size_t ch_sz)
++{
++	int ret = 0;
++
++	/* no validations.*/
++
++	if ((offset + ch_sz) > (peer_mem_base->size)) {
++		ret = -ENOMEM;
++		ERR("(%s): channel mem offset beyond pcie aperture\n",
++			 channel->name);
++		ERR("offset=(0x%016zx), ch_sz=(0x%016zx)\n", offset, ch_sz);
++		ERR("aper_mem=(%pa[p]), size=(0x%016zx)\n",
++			&(peer_mem_base->aper), peer_mem_base->size);
++	}
++
++	if ((offset + ch_sz) > (self_mem_base->size)) {
++		ret = -ENOMEM;
++		ERR("(%s): channel mem offset beyond pcie shared mem\n",
++			 channel->name);
++		ERR("offset=(0x%016zx), ch_sz=(0x%016zx)\n", offset, ch_sz);
++		ERR("aper_mem=(%pa[d]), size=(0x%016zx)\n",
++			&(self_mem_base->dma_handle), self_mem_base->size);
++	}
++
++	return ret;
++}
++
++/* DEBUG only. */
++static void print_channel_info(struct channel_t *channel)
++{
++	DBG("\n");
++	DBG("(%s) device channel::\n", channel->name);
++	DBG("\t\t alignment = (0x%x)\n", channel->align);
++	DBG("\t\t ctrl hdr size = (0x%x)\n", (CH_HDR_SIZE));
++	DBG("\t\t nframes=(0x%X) frame_size=(0x%08X)",
++		  channel->nframes, channel->frame_sz);
++	DBG("\t\t notification event::\n");
++	DBG("\t\t\ttype     = (%s)\n", (channel->event_type == 0) ?
++						("NTB doorbell"):("syncpoint"));
++	DBG("\t\t\tprod_id  = (0x%02X)\n", channel->prod_event_id);
++	DBG("\t\t\tcons_id  = (0x%02X)\n", channel->cons_event_id);
++	DBG("\t\t\tstate_id = (0x%02X)\n", channel->state_event_id);
++	DBG("\t\t tx_aper:   (%pa[p]) size:(0x%016zx)\n",
++		 &(channel->tx_mem.aper), channel->tx_mem.size);
++	DBG("\t\t rx_aper:   (%pa[d]) size:(0x%016zx)\n",
++		 &(channel->rx_mem.dma_handle), channel->rx_mem.size);
++	DBG("\t\t ctlr_aper: (0x%016llx) size:(0x%016zx)\n",
++		 channel->ctrl_mem.phys_addr, channel->ctrl_mem.size);
++}
+diff --git a/drivers/misc/nvscic2c/channel.h b/drivers/misc/nvscic2c/channel.h
+new file mode 100644
+index 0000000..40bdd19
+--- /dev/null
++++ b/drivers/misc/nvscic2c/channel.h
+@@ -0,0 +1,278 @@
++/*
++ * Copyright (c) 2019, NVIDIA CORPORATION.  All rights reserved.
++ *
++ * This program is free software; you can redistribute it and/or modify it
++ * under the terms and conditions of the GNU General Public License,
++ * version 2, as published by the Free Software Foundation.
++ *
++ * This program is distributed in the hope it will be useful, but WITHOUT
++ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
++ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for
++ * more details.
++ */
++
++/*
++ * Internal: only and only to be included in channel-cdev.c & channel-ops.c
++ * or any other file that is part of nvscic2c channel and channel device
++ * abstraction. This file is not supposed to be included other entities
++ * in nvscic2c module.
++ *
++ * Channel abstraction interfaces to module.c go in chip-to-chip.h. This
++ * file gets included within channel abstraction.
++ */
++#ifndef __CHANNEL_H__
++#define __CHANNEL_H__
++
++
++#include "chip-to-chip.h"
++#include <linux/types.h>
++#include <linux/cdev.h>
++#include <linux/wait.h>
++#include <linux/atomic.h>
++#include <linux/printk.h>
++#ifdef CONFIG_DEBUG_FS
++#include <linux/debugfs.h>
++#endif
++
++
++/* over-ride these so that:
++ * - we do not instantiate as a platform device.
++ * - we do not use NTB device for spews.
++ * - judiciously use 80 column limit.
++ * - add abstraction within module.
++ */
++#define ERR(...)		pr_err(MODULE_NAME": channel:\t" __VA_ARGS__)
++#define INFO(...)		pr_info(MODULE_NAME": channel:\t" __VA_ARGS__)
++#define DBG(...)		pr_debug(MODULE_NAME": channel:\t" __VA_ARGS__)
++
++
++/*
++ * Offests for flow-control/state fields in the nvscic2c dev channel
++ * header. All fields are at the moment are 32-bit wide.
++ *
++ * IMPORTANT: If these change from 32-bit to other, change must be
++ * made here too. Also, must be in-sync with user-space SW(same host) and
++ * nvscic2c on remote host.
++ *
++ * These are used for writing/updating channel header fields of
++ * peer host over PCIe by CPU or for reading the same fields that remote
++ * updated on our PCIe shared mem over PCIe or for reading from the
++ * control memory that each channel privately manages and updates.
++ *
++ * (CH_HDR_RESERVED_OFF+4bytes) to start data on 8-byte boundary for better
++ *  perf with PCIe Wr.
++ */
++#define CH_HDR_TX_CNTR_OFF	(0x00)
++#define CH_HDR_RX_CNTR_OFF	(0x04)
++#define CH_HDR_W_SLEEP_OFF	(0x08)
++#define CH_HDR_R_SLEEP_OFF	(0x0C)
++#define CH_HDR_STATE_OFF	(0x10)
++#define CH_HDR_RESERVED_OFF	(0x14)
++#define CH_DATA_PAYLOAD_OFF	(0x18)
++#define CH_HDR_SIZE		(CH_DATA_PAYLOAD_OFF)
++
++
++/*
++ * nvscic2c channel state negotiation protocol.
++ *
++ * Must be in-sync with user-space SW on same host and with remote
++ * nvscic2c host.
++ *
++ * As channel state management is in user-space SW this is required
++ * for poll()/select() implementation, where in if channel is not in
++ * ESTABLISHED state shall return can_read()/can_write() as false.
++ *
++ * For detailed description of these states, refer user-space nvscic2c SW.
++ */
++enum channel_state {
++	CH_STATE_ESTABLISHED = 0,
++	CH_STATE_SYNC,
++	CH_STATE_ACK,
++};
++
++
++/*
++ * nvscic2c channel data-processing thread state.
++ *
++ * Must be in-sync with user-space SW on same host and with remote
++ * nvscic2c host.
++ *
++ * Used to inidicate remote entity about the xfer/processing status
++ * of the producer/consumer
++ *
++ * Required in LKM only to initialise the corresponding fields in the
++ * channel header with the defaults. For detailed description of these states,
++ * refer user-space nvscic2c SW.
++ */
++enum channel_xfer_state {
++	CH_XFER_RUNNING = 0,
++	CH_XFER_WAITING,
++	CH_XFER_INVALID,
++};
++
++
++/*
++ * Masked offsets to return to user, allowing them to mmap
++ * different memory segments of channel in user-space.
++ */
++enum mem_mmap_type {
++	/* Invalid.*/
++	MEM_MMAP_INVALID = 0,
++	/* Map Peer PCIe aperture: For Tx across PCIe.*/
++	PEER_MEM_MMAP,
++	/* Map Self PCIe shared memory: For Rx across PCIe.*/
++	SELF_MEM_MMAP,
++	/* Map Self memory(not exposed via PCIe).*/
++	CTRL_MEM_MMAP,
++	/* Map Link memory segment to query link status with Peer.*/
++	LINK_MEM_MMAP,
++	/* Maximum. */
++	MEM_MAX_MMAP,
++};
++
++
++/* private data structure for every channel device. */
++struct channel_t {
++	/* properties / attributes of this channel.*/
++	char name[MAX_NAME_LEN];
++
++	/* notification for the peer - data and state.*/
++	uint8_t event_type;
++	uint8_t prod_event_id;
++	uint8_t cons_event_id;
++	uint8_t state_event_id;
++
++	/* slot/frames this channel is divided into honoring alignment.*/
++	uint16_t nframes;
++	uint32_t frame_sz;
++	uint16_t align;
++
++	/* flow-control/channel state information updated by local for
++	 * remote to read/refer over PCIe. Write-Only by Self host.
++	 * Mapped to user-space: TX_MEM_MMAP.
++	 */
++	struct pci_mmio_t tx_mem;
++
++	/* flow-control/channel state information as updated by remote
++	 * host over PCIe. Read-Only by Self host. Exposed to Peer as
++	 * PCIe shared memory. Mapped to user-space: RX_MEM_MMAP.
++	 */
++	struct dma_buff_t rx_mem;
++
++	/* flow-control/channel state information as updated by self locally.
++	 * Not exposed to Peer host. Mapped to user-space: CTRL_MEM_MMAP.
++	 */
++	struct cpu_buff_t ctrl_mem;
++
++	/* channel is a bulk data xfer channel? if so, then direction.*/
++	enum bulk_xfer_type bulk_xfer_mode;
++
++	/* device management.*/
++	int minor;
++	dev_t dev;
++	struct cdev cdev;
++	struct device *device;
++
++	/* poll/notifications.*/
++	wait_queue_head_t waitq;
++
++	/* serialise access to fops.*/
++	struct mutex fops_lock;
++	bool in_use;
++
++	/* book-keeping of channel doorbell events.*/
++	atomic_t db_event;
++
++	/* book-keeping of channel state change db events.*/
++	atomic_t link_change_event;
++
++#ifdef CONFIG_DEBUG_FS
++	struct dentry *dbgfs_root;
++	off_t dbgfs_iteration;
++#endif
++};
++
++
++/*
++ * Overall context for the channel sub-module of  nvscic2c module.
++ * This is to meet the expectation of channel abstraction.
++ */
++struct channel_drv_ctx_t {
++	/* entire char device region allocated for all channels.*/
++	dev_t char_dev;
++
++	/* every channel device will be registered to this class.*/
++	struct class *class;
++
++	/* array of nvscic2c channel devices.*/
++	int8_t channel_nr;
++	struct channel_t *channels;
++
++	/* NTB db <-> Channel association.
++	 * To route the notification from peer to the right channel.
++	 * db vectors: [0, max supported-1].
++	 */
++	int32_t db_vec_nr;
++	struct channel_t **db_ch_tbl;
++	struct mutex db_ch_tbl_lock;
++
++	/* Receive area: PCIe shared mem. Peer's Rd/Wr reflect here. */
++	struct dma_buff_t self_mem_base;
++
++	/* Transmit area: PCIe aperture. Self's Rd/Wr to Peer go via this.*/
++	struct pci_mmio_t peer_mem_base;
++
++	/* offset to fragment the self and peer base memory into channels.
++	 * every channel adds its channel size requirement to this and is
++	 * then used to assign offset to next channel.
++	 */
++	off_t running_off;
++};
++
++
++/* helper function to validate the nvscic2c channel parameters
++ * as parsed from config.c or DT.
++ */
++int validate_channel_params(struct channel_t *channel);
++
++
++/*
++ * Allocate and initialise each nvscic2c channel internals with 3 different
++ * memories: Tx(PCIe Aperture), Rx (PCIe Shared Mem) and CtrlMem for maintaining
++ * control flow information not exposed to Peer.
++ *
++ * Fragment the nvscic2c memory: peer and self into channels starting
++ * at provided offset. Also, update the offset with the channel size
++ * requirements to be able to start next channel from there.
++ *
++ * Not thread-safe.
++ */
++int channel_alloc(struct channel_t *channel,
++		  struct dma_buff_t *self_mem_base,
++		  struct pci_mmio_t *peer_mem_base,
++		  off_t *curr_off);
++
++/* Free the resources made for the channel.
++ *
++ * Support for channel alloc()->channel free()->channel alloc() isn't there.
++ */
++int channel_free(struct channel_t *channel);
++
++#ifdef CONFIG_DEBUG_FS
++/*
++ * Helper API to create the Debugfs interface for each nvscic2c
++ * channel device and enable MANUAL VERFICATION of read/write from
++ * user-space to LKM and vice-versa for same memory: Tx(Peer), Self(Rx),
++ * Ctrl and Link.
++ *
++ * purely for debugging purpose.
++ */
++int channel_dbgfs_create(struct channel_t *channel);
++
++/*
++ * to clean up the debugfs interface.
++ */
++void channel_dbgfs_remove(struct channel_t *channel);
++#endif //CONFIG_DEBUG_FS
++
++#endif // __CHANNEL__
+diff --git a/drivers/misc/nvscic2c/chip-to-chip.h b/drivers/misc/nvscic2c/chip-to-chip.h
+new file mode 100644
+index 0000000..62d5266
+--- /dev/null
++++ b/drivers/misc/nvscic2c/chip-to-chip.h
+@@ -0,0 +1,409 @@
++/*
++ * Copyright (c) 2019, NVIDIA CORPORATION.  All rights reserved.
++ *
++ * This program is free software; you can redistribute it and/or modify it
++ * under the terms and conditions of the GNU General Public License,
++ * version 2, as published by the Free Software Foundation.
++ *
++ * This program is distributed in the hope it will be useful, but WITHOUT
++ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
++ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for
++ * more details.
++ */
++
++/*
++ * Internal to nvscic2c module. This file is not supposed to be included
++ * by any other external modules.
++ */
++#ifndef __CHIP_TO_CHIP_H__
++#define __CHIP_TO_CHIP_H__
++
++
++#include <linux/mm.h>
++#include <linux/types.h>
++#include <linux/nvscic2c-ioctl.h>
++
++
++/* Name of our module: used in all the files, channel device prefix.*/
++#define MODULE_NAME	"nvscic2c"
++
++
++/* Maximum length of any string used - channel name, thread name, etc. */
++#define MAX_NAME_LEN	(32)
++
++
++/* some channels may not have all the DBs that we have in our data-structures,
++ * for e.g Bulk transfer channels have two DBs rather than three.
++ * use this MACRO to differentiate when somebody wants a NIL DB(=NO DB)
++ */
++#define DB_ID_NIL	(0xFF)
++
++
++/* PCIe aperture memory type for Tx/Rx Peer via BAR. */
++struct pci_mmio_t {
++	/* Physical Pcie aperture - BAR aperture.*/
++	phys_addr_t aper;
++
++	/* PVA for the BAR aperture.*/
++	void __iomem *pva;
++
++	/* size of the BAR aperture.*/
++	size_t size;
++};
++
++
++/* PCIe Shared memory registered/exported to peer.
++ * Either pointing to reserved fixed address or memory
++ * allocated by dma_buf API.
++ */
++struct dma_buff_t {
++	/* local VA for CPU access. */
++	void *pva;
++
++	/* iova(iommu=ON) or bus address/physical address. */
++	dma_addr_t dma_handle;
++
++	/* size of the memory allocated. */
++	size_t size;
++};
++
++
++/* CPU-only accessible memory which is not PCIe aper or PCIe
++ * shared memory. Typically will contain information of memory
++ * allocated via kalloc()/kzalloc*().
++ */
++struct cpu_buff_t {
++	/* cpu address(va). */
++	void *pva;
++
++	/* physical address. */
++	uint64_t phys_addr;
++
++	/* size of the memory allocated. */
++	size_t size;
++};
++
++/*
++ * Parameters that each c2c channel shall be configured from. These parameters
++ * are either populated from DT file(aarch64) or via config file(x86_64).
++ * Applies to both CPU and Bulk transfer channels.
++ *
++ * These are read-only for the rest of the nvscic2c module.
++ *
++ * This serves as an abstraction, nvscic2c module uses this to setup the c2c
++ * channels without worrying whether they come from DT or a config file.
++ */
++struct channel_param_t {
++	/* Id for a channel, picked up from config.c.*/
++	uint8_t ch_id;
++
++	/* human readable name assigned to a c2c channel. - Debug only. */
++	char ch_name[MAX_NAME_LEN];
++
++	/* Configuration for event notification for a c2c channel, as read
++	 * from DT or configuration file.
++	 * - event notification type: NTB doorbell or Propietary,
++	 * - event notification ID for proxy producer: wait & trigger.
++	 * - event notification ID for proxy consumer: wait & trigger.
++	 * - event notification ID for state management: wait & trigger.
++	 */
++	uint8_t event_type;
++	uint8_t prod_event_id;
++	uint8_t cons_event_id;
++	uint8_t state_event_id;
++
++	/* every c2c channel is fragmented into slots/frames that self
++	 * can read what remote has written into. Both for Tx and Rx memory
++	 * in identical way. Alignment to be honored.
++	 */
++	int16_t nframes;
++	uint32_t frame_sz;
++	int16_t align;
++
++	/* channel is a bulk data xfer channel? if so, then direction.*/
++	enum bulk_xfer_type bulk_xfer_mode;
++};
++
++
++/*
++ * Configurable parameters for the nvscic2c module. These contain the
++ * c2c channel parameters also but along with them global parameters which
++ * are configurable for c2c module.
++ *
++ * These are read-only for the rest of the nvscic2c module.
++ *
++ * This serves as an abstraction, nvscic2c module uses this to setup the c2c
++ * channels without worrying whether they come from DT or a config file.
++ *
++ * All of these (and nested) configuration parameters MUST BE IN SYNC WITH
++ * REMOTE HOST.
++ */
++struct c2c_param_t {
++	/* minimum PCIe shared memory window - configurable as required
++	 * for supporting multiple use-cases. - As read from DT module
++	 * or configuration module.
++	 */
++	size_t req_mw_sz;
++
++	/* fixed physical address to be used for setting up PCIe shared mem.
++	 * Parameter given while loading module shall over-ride the same
++	 * setting provided in config.c file.
++	 */
++	uint64_t fixed_mw_addr;
++	size_t fixed_mw_sz;
++	bool use_fixed_addr;
++
++	/* all enabled c2c channel configuration - CPU or Bulk.*/
++	uint8_t channel_nr;
++	struct channel_param_t *ch_params;
++};
++
++
++/*
++ * defines the nvscic2c module driver context. Shall contain all the
++ * c2c channels: configuration, char devices, link management thread,
++ * base memory allocated for Rx(PCIe shared memory) and mapped for Tx
++ * memory (PCIe aperture).
++ */
++struct c2c_drv_ctx_t {
++	/* the configuration for module and individual channels.*/
++	struct c2c_param_t c2c_param;
++
++	/* Receive area: PCIe shared mem. Peer's Rd/Wr reflect here. */
++	struct dma_buff_t self_mem;
++
++	/* Transmit area: PCIe aperture. Self's Rd/Wr to Peer go via this.*/
++	struct pci_mmio_t peer_mem;
++};
++
++
++/*
++ * called by nvscic2c module to parse the static configuration we have
++ * set above. On aarch64 this is DT parsing, but on x86_64 we do not want
++ * to use DT mechanism, parse the statically defined configuration above
++ * into nvscic2c module c2c_param_t structure.
++ */
++int config_parse(struct c2c_param_t *c2c_param);
++
++
++/*
++ * called by nvscic2c module to free up the memory allocated during
++ * config_parse(). Like for a like replacement for dt_release() on
++ * x86_64.
++ */
++int config_release(struct c2c_param_t *c2c_param);
++
++
++/*
++ * Interface for nvscic2c driver to register itself as a NTB client driver.
++ *
++ * Because, we expect nvscic2c window size requirements to be fulfilled
++ * by PCIe NTB share memory, this function should be called after successful
++ * parsing of config.c
++ *
++ * THIS INTERNALLY WAITS FOR NTB PROBE TO COMPLETE. IF NTB DRIVER WASN'T LOADED
++ * IT WOULD TIMEOUT AND RETURN FAILURE.
++ */
++int ntb_client_register(struct c2c_drv_ctx_t *drv_ctx);
++
++
++/*
++ * Interface for nvscic2c driver to unload the NTB client driver.
++ *
++ * As a result the NTB link between two SoC's would go DOWN.
++ */
++void ntb_client_unregister(struct c2c_drv_ctx_t *drv_ctx);
++
++
++/*
++ * NTB client driver has a private context, query the pcie shared memory
++ * with the caller
++ *
++ * Can be called once NTB client is registered with NTB properly.
++ */
++int ntb_client_query_mem_info(struct dma_buff_t *self_mem,
++				struct pci_mmio_t *peer_mem);
++
++/*
++ * This function allows nvscic2c driver to set the link state as
++ * UP(true) or DOWN(false) when the NTB client driver was registered properly.
++ *
++ * Expected use is, to set the link to TRUE when nvscic2c is done setup of
++ * all c2c channels and is ready to exchange data.
++ *
++ * true: link up, false otherwise.
++ */
++int ntb_client_set_link_status(enum link_status status);
++
++
++/*
++ * Wrapper over corresponding NTB api, added to maintain abstraction:
++ * channel functionality doesn't call directly into NTB apis
++ * but only via ntb-client.
++ */
++int ntb_client_db_vector_count(void);
++
++
++/*
++ * Wrapper over corresponding NTB api, added to maintain abstraction:
++ * channel functionality doesn't call directly into NTB apis
++ * but only via ntb-client.
++ */
++int ntb_client_db_set_mask(uint64_t db_bits);
++
++
++/*
++ * Wrapper over corresponding NTB api, added to maintain abstraction:
++ * channel functionality doesn't call directly into NTB apis
++ * but only via ntb-client.
++ */
++int ntb_client_db_clear_mask(uint64_t db_bits);
++
++/*
++ * Wrapper over corresponding NTB api, added to maintain abstraction:
++ * channel functionality doesn't call directly into NTB apis
++ * but only via ntb-client.
++ */
++int ntb_client_db_clear(uint64_t db_bits);
++
++/*
++ * Wrapper over corresponding NTB api, added to maintain abstraction:
++ * channel functionality doesn't call directly into NTB apis
++ * but only via ntb-client.
++ */
++int ntb_client_peer_db_set(uint64_t db_bits);
++
++/*
++ * Export nvscic2c(channel-cdev.c) dev node portion of self memory:
++ * Rx memory to userspace via mmap() call. Reason for this implementation
++ * being, if PCIe shared mem was allocated using dma-buff apis, channel
++ * abstraction would not have ntbdev to do mmap for dma buffer. Also,
++ * channel doesn't if fixed address(iommu=off) is being used.
++ *
++ * If nvscic2c module has called link_mgmt_release(), it must not
++ * refer link_status_mem anytime after that.
++ */
++int ntb_client_mmap_self_mem(struct vm_area_struct *vma,
++				struct dma_buff_t *self_mem);
++
++/*
++ * Entry point for the nvscic2c channel char device sub-module/abstraction.
++ *
++ * On successful return (0), devices would have been created and ready to
++ * accept ioctls from user-space application.
++ *
++ * Mapping of each NTB doorbell to a C2C channel is also maintained here.
++ *
++ * We must come here after setting up the NTB client with PCIe shared memory
++ * (Self) and PCIe aperture(Peer) available.
++ */
++int channel_setup_devices(struct c2c_drv_ctx_t *drv_ctx);
++
++
++/* exit point for nvscic2c channel char device sub-module/abstraction.*/
++int channel_release_devices(struct c2c_drv_ctx_t *drv_ctx);
++
++
++/*
++ * Function called by nvscic2c module.c on seeing a change in the
++ * NTB link status. Here we pass on this event to each channel
++ * which is required for their poll() implementation.
++ *
++ * This is supposed to be called only change in link status not
++ * for every NTB link event(hb).
++ */
++int channel_link_event(enum link_status status);
++
++
++/*
++ * Function called by NTB client(ntb-client) on getting a NTB DB
++ * event.
++ *
++ * We receive the DB vector/index which triggered this event.
++ * We internally go through the channel and db association and
++ * pass on the db event to relevant channel.
++ *
++ * A channel will/may have multiple DB's but we should be get only
++ * 1 DB per event callback.
++ */
++int channel_db_event(int db_idx);
++
++
++/*
++ * Entry point for the link management sub-module/abstraction.
++ *
++ * Link mgmt abstraction keeps track of previous link state. If this
++ * changes to a different state than previous state, we invoke a callback
++ * nvscic2c module(module.c) registers with link_mgmt to notify all channels
++ * for link status change.
++ *
++ * On successful return (0), link monitoring thread would sends the first link
++ * UP event to remote and then waits for Link UP heart beats.
++ *
++ * THIS ENABLES THE NTB LINK, hence must be called when all setup is done.
++ *
++ * Also allocates the link status memory which nvscic2c dev exports to user-
++ * space via mmap.
++ *
++ * CAVEAT: nvscic2c dev nodes export mmap which shall map link status memory
++ * to user-space. We would start this link_mgmt once all devices are created
++ * but we also allocate this status memory when starting link_mgmt thread.
++ * Hence, there would be a small window where the nvscic2c devices have been
++ * setup and mmap is exported but link_mgmt module may not be ready yet.
++ */
++/* callback options to register with link mgmt module. */
++struct link_mgmt_ops {
++	/* a callback invoked on a change in link status.*/
++	void (*link_status_changed)(enum link_status status,
++				    void *ctx);
++	/* context that will link_mgmt should return along with cb.*/
++	void *ctx;
++};
++int link_mgmt_start(struct link_mgmt_ops *ops);
++
++
++/* exit point for link mgmt sub-module/abstraction.*/
++int link_mgmt_stop(void);
++
++
++/*
++ * used by channel abstraction to query the current link status.
++ * for poll() implementation.
++ *
++ * If nvscic2c module has called link_mgmt_release(), it must not
++ * refer link_status_mem anytime after that.
++ */
++enum link_status link_mgmt_get_link_status(void);
++
++
++/*
++ * used by channel abstraction to query the size of the link status
++ * memory that shall be exported to userspace SW. for ioctl()/mmap()
++ * implementation.
++ *
++ * If nvscic2c module has called link_mgmt_release(), it must not
++ * refer link_status_mem anytime after that.
++ */
++size_t link_mgmt_get_status_mem_size(void);
++
++
++/*
++ * helper function to mmap the link status memory for an nvscic2c
++ * dev node. This is required because the channel abstraction doesn't
++ * keep the link status memory credentials with itself.
++ *
++ * If nvscic2c module has called link_mgmt_release(), it must not
++ * refer link_status_mem anytime after that.
++ */
++int link_mgmt_mmap_status_mem(struct vm_area_struct *vma);
++
++
++/*
++ * Registered with NTB client abstraction(ntb-client.c). On every link
++ * event received by peer for NTB link, this callback shall be invoked.
++ *
++ * The status received in this callback is fed to monitor thread of
++ * link mgmt thread to decide change in link status.
++ */
++void link_mgmt_event_cb(enum link_status status);
++#endif //__CHIP_TO_CHIP_H__
+diff --git a/drivers/misc/nvscic2c/config.c b/drivers/misc/nvscic2c/config.c
+new file mode 100644
+index 0000000..78e31e7
+--- /dev/null
++++ b/drivers/misc/nvscic2c/config.c
+@@ -0,0 +1,394 @@
++/*
++ * Copyright (c) 2019, NVIDIA CORPORATION.  All rights reserved.
++ *
++ * This program is free software; you can redistribute it and/or modify it
++ * under the terms and conditions of the GNU General Public License,
++ * version 2, as published by the Free Software Foundation.
++ *
++ * This program is distributed in the hope it will be useful, but WITHOUT
++ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
++ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for
++ * more details.
++ */
++
++#include "chip-to-chip.h"
++#include <linux/errno.h>
++#include <linux/slab.h>
++#include <linux/printk.h>
++#include <linux/nvscic2c-ioctl.h>
++
++
++/* over-ride these so that:
++ * - we do not instantiate as a platform device.
++ * - we do not use NTB device for spews.
++ * - judiciously use 80 column limit.
++ * - add abstraction within module.
++ */
++#define ERR(...)	pr_err(MODULE_NAME": config:\t" __VA_ARGS__)
++#define INFO(...)	pr_info(MODULE_NAME": config:\t" __VA_ARGS__)
++#define DBG(...)	pr_debug(MODULE_NAME": config:\t" __VA_ARGS__)
++
++
++/* Maximum c2c channels supported.*/
++#define MAX_CHANNELS	(16)
++
++
++/*
++ * Frames/Slots in which the C2C channel Tx and Rx memory is fragemented
++ * into. Must be in-sync with the remote host for the same given channel.
++ * Applicable to both CPU and Bulk channels.
++ */
++struct frame_cfg_t {
++	/* frames/slot count.*/
++	uint16_t nframes;
++
++	/* size of each frame/slot. */
++	uint32_t frame_sz;
++};
++
++
++/*
++ * nevent configuration per c2c channel (channels wait for / trigger
++ * MSI-X using nevent abstraction. This data-type allows user to
++ * specify the nevent IDs used for a given channel. Must be in-sync
++ * with remote host for a given channel.
++ */
++struct nevent_cfg_t {
++	/* Notification type: NTB doorbell or Propietary. Unused for x86_64.*/
++	uint8_t type;
++
++	/* Used by proxy-prod thread to wait for/trigger MSI-X notification
++	 * from/for proxy-cons.
++	 */
++	uint8_t	id_1;
++
++	/* Used by proxy-cons thread to wait for/trigger MSI-X notification
++	 * from/for proxy-prod.
++	 */
++	uint8_t	id_2;
++
++	/* Used by state management thread for c2c channel state mgmt.*/
++	uint8_t	id_3;
++};
++
++
++/*
++ * C2C channel configuration as entered here in config.h.
++ * Shall be read-only for other files in the nvscic2c module.
++ */
++struct channel_cfg_t {
++	/* is channel enabled to be used.*/
++	bool enable;
++
++	/* alignment for this channel, must be multiple of 4K (PAGE_SIZE). */
++	uint16_t align;
++
++	/* PCIe shared memory fragmentation/slots.*/
++	struct frame_cfg_t frames;
++
++	/* nevent configuration.*/
++	struct nevent_cfg_t nevent;
++
++	/* if it's bulk data xfer channel, then what role - prod or cons.*/
++	enum bulk_xfer_type bulk_xfer_mode;
++};
++
++
++/*
++ * Editable/configurable C2C module configuration by user. Any change here shall
++ * reflect only after re-compilation re-flashing of the newly built nvscic2c.ko
++ * module.
++ *
++ * The static initialisation below must be in-sync with remote nvscic2c host
++ * or must complement remote nvscic2c host for bulk xfer channel role.
++ *
++ * THIS IS REPLACEMENT FOR DEVICE TREE FOR AARCH64 PLATFORM.
++ */
++static struct c2c_cfg_t {
++	/* size of the mem window we shall expose to remote host in BAR#4.
++	 * This is proportional to nvscic2c channels we support.
++	 */
++	size_t req_mw_sz;
++
++	/* fixed physical address to be used for setting up PCIe shared mem.
++	 * ASSUMING THIS WAY IS WHEN PLATFORM DOESN'T SUPPORT IOMMU.
++	 */
++	uint64_t fixed_mw_addr;
++
++	/* it's size.
++	 * ASSUMING THIS WAY IS WHEN PLATFORM DOESN'T SUPPORT IOMMU.
++	 */
++	size_t fixed_mw_sz;
++
++	/* settings for all the supported C2C channels. - bulk or CPU.*/
++	struct channel_cfg_t channels[MAX_CHANNELS];
++} c2c_config = {
++	/* Expected memory window size we expect to work with. This will
++	 * be the size of PCIe shared memory exposed to remote. Must be
++	 * in-sync with remote host. Proportional to channels we support.
++	 */
++	.req_mw_sz		= 0x10000000,
++
++	/* change this to reflect the physical memory reserved for mw.
++	 * This would get over-ridden by similar module parameter.
++	 * if provided.
++	 */
++	.fixed_mw_addr		= 0x0,
++	.fixed_mw_sz		= 0x0,
++
++	/* all the supported channels with this host. Again must be
++	 * in-sync with remote host.
++	 */
++	.channels = {
++		/* CPU channel. RemoteHost <-> x86. */
++		[0] = {
++			.enable = true,
++			.align  = 0x1000,
++			.frames = { 0x40, 0x600 },
++			.nevent = { 0x00, 0x00, 0x01, 0x02 },
++		},
++
++		/* Bulk transfer channel RemoteHost -> x86. */
++		[1] = {
++			.enable = true,
++			.align  = 0x1000,
++			.frames = { 0x03, 0x400000 },
++			.nevent = { 0x0, 0x03, DB_ID_NIL, 0x04 },
++			.bulk_xfer_mode = BULK_XFER_TYPE_PRODUCER,
++		},
++
++		/* Bulk transfer channel RemoteHost <- x86. */
++		[2] = {
++			.enable = true,
++			.align  = 0x1000,
++			.frames = { 0x03, 0x400000 },
++			.nevent = { 0x0, DB_ID_NIL, 0x05, 0x06 },
++			.bulk_xfer_mode = BULK_XFER_TYPE_CONSUMER,
++		},
++
++		/* Bulk transfer channel RemoteHost -> x86. */
++		[3] = {
++			.enable = true,
++			.align  = 0x1000,
++			.frames = { 0x03, 0x400000 },
++			.nevent = { 0x0, 0x07, DB_ID_NIL, 0x08 },
++			.bulk_xfer_mode = BULK_XFER_TYPE_PRODUCER_PCIE_READ,
++		},
++
++		/* Bulk transfer channel RemoteHost <- x86. */
++		[4] = {
++			.enable = true,
++			.align  = 0x1000,
++			.frames = { 0x03, 0x400000 },
++			.nevent = { 0x0, DB_ID_NIL, 0x09, 0x0A },
++			.bulk_xfer_mode = BULK_XFER_TYPE_CONSUMER_PCIE_READ,
++		},
++
++		/* Bulk transfer channel RemoteHost -> x86. */
++		[5] = {
++			.enable = true,
++			.align  = 0x1000,
++			.frames = { 0x02, 0xF00000 },
++			.nevent = { 0x0, 0x0B, DB_ID_NIL, 0x0C },
++			.bulk_xfer_mode = BULK_XFER_TYPE_PRODUCER,
++		},
++
++		/* Bulk transfer channel RemoteHost -> x86. */
++		[6] = {
++			.enable = true,
++			.align  = 0x1000,
++			.frames = { 0x02, 0xF00000 },
++			.nevent = { 0x0, 0x0D, DB_ID_NIL, 0x0E },
++			.bulk_xfer_mode = BULK_XFER_TYPE_PRODUCER,
++		},
++
++		/* Bulk transfer channel RemoteHost -> x86. */
++		[7] = {
++			.enable = true,
++			.align  = 0x1000,
++			.frames = { 0x02, 0xF00000 },
++			.nevent = { 0x0, 0x0F, DB_ID_NIL, 0x10 },
++			.bulk_xfer_mode = BULK_XFER_TYPE_PRODUCER,
++		},
++
++		/* Bulk transfer channel RemoteHost -> x86. */
++		[8] = {
++			.enable = true,
++			.align  = 0x1000,
++			.frames = { 0x02, 0xF00000 },
++			.nevent = { 0x0, 0x011, DB_ID_NIL, 0x12 },
++			.bulk_xfer_mode = BULK_XFER_TYPE_PRODUCER,
++		},
++
++		/* Bulk transfer channel RemoteHost <- x86. */
++		[9] = {
++			.enable = true,
++			.align  = 0x1000,
++			.frames = { 0x02, 0x2800000 },
++			.nevent = { 0x0, DB_ID_NIL, 0x13, 0x14 },
++			.bulk_xfer_mode = BULK_XFER_TYPE_CONSUMER_PCIE_READ,
++		},
++	},
++};
++
++/* prototype.*/
++static void config_print(struct c2c_param_t *c2c_param);
++
++
++/*
++ * called by nvscic2c module to free up the memory allocated during
++ * config_parse(). Like for a like replacement for dt_release() on
++ * x86_64.
++ */
++int config_release(struct c2c_param_t *c2c_param)
++{
++	int ret = 0;
++
++	if (c2c_param == NULL)
++		return ret;
++
++	kfree(c2c_param->ch_params);
++	c2c_param->ch_params = NULL;
++
++	return ret;
++}
++
++
++/*
++ * called by nvscic2c module to parse the static configuration we have
++ * set above. On aarch64 this is DT parsing, but on x86_64 we do not want
++ * to use DT mechanism, parse the statically defined configuration above
++ * into nvscic2c module c2c_param_t structure.
++ */
++int config_parse(struct c2c_param_t *c2c_param)
++{
++	uint8_t i = 0, j = 0;
++	int ret = 0;
++
++	/* validation. */
++	if (c2c_param == NULL) {
++		ERR("(%s): Invalid Param\n", __func__);
++		ret = -EINVAL;
++		goto err;
++	}
++
++	/* start by allocating space for max channels supported.*/
++	c2c_param->ch_params = kzalloc((sizeof(*c2c_param->ch_params)
++								* MAX_CHANNELS),
++					GFP_KERNEL);
++	if (c2c_param->ch_params == NULL) {
++		ret = -ENOMEM;
++		ERR("Failed to allocate driver ctx\n");
++		goto err;
++	}
++
++	/* loop through all statically defined channels and populate
++	 * c2c_param with enabled channel information.
++	 */
++	for (i = 0, j = 0; i < MAX_CHANNELS; i++) {
++		struct channel_param_t *param = NULL;
++		struct channel_cfg_t *cfg = NULL;
++
++		cfg   = &(c2c_config.channels[i]);
++		param = &(c2c_param->ch_params[j]);
++
++		/* defaults which are non-zero/non-null.*/
++		param->prod_event_id  = DB_ID_NIL;
++		param->cons_event_id  = DB_ID_NIL;
++		param->state_event_id = DB_ID_NIL;
++		param->nframes        = -1;
++
++		/* if channel is not enabled, skip to next one.*/
++		if (cfg->enable != true)
++			continue;
++
++		param->ch_id          = i;
++		param->nframes        = cfg->frames.nframes;
++		param->frame_sz       = cfg->frames.frame_sz;
++		param->align          = cfg->align;
++		param->event_type     = cfg->nevent.type;
++		param->prod_event_id  = cfg->nevent.id_1;
++		param->cons_event_id  = cfg->nevent.id_2;
++		param->state_event_id = cfg->nevent.id_3;
++		param->bulk_xfer_mode = cfg->bulk_xfer_mode;
++		snprintf(param->ch_name, MAX_NAME_LEN, "%s_%d",
++						 MODULE_NAME, param->ch_id);
++		j++;
++	}
++
++	/* if we couldn't find any enabled channels.*/
++	if (!j) {
++		ret = -ENODATA;
++		ERR("Failed to parse any enabled c2c channel in config\n");
++		goto err;
++	}
++
++	/* device/global settings which are not per-channel. */
++	c2c_param->channel_nr      = j;
++	c2c_param->req_mw_sz       = c2c_config.req_mw_sz;
++	if ((c2c_config.fixed_mw_addr >= 0x80000000)
++		&& (c2c_config.fixed_mw_sz)) {
++		c2c_param->use_fixed_addr = true;
++		c2c_param->fixed_mw_addr  = c2c_config.fixed_mw_addr;
++		c2c_param->fixed_mw_sz    = c2c_config.fixed_mw_sz;
++	}
++
++	/* debug only. */
++	config_print(c2c_param);
++
++	return ret;
++
++err:
++	config_release(c2c_param);
++	return ret;
++}
++
++
++/*
++ * Debug only.
++ */
++static void config_print(struct c2c_param_t *c2c_param)
++{
++	int i = 0;
++
++	DBG("\n");
++	DBG("C2C config file parsing leads to:\n");
++	DBG("\tmin_win_sz      = (0x%08zX)\n", c2c_param->req_mw_sz);
++	if (c2c_param->use_fixed_addr) {
++		DBG("\tfixed_mw_addr   = (0x%08llX)\n",
++						 c2c_param->fixed_mw_addr);
++		DBG("\tfixed_mw_sz     = (0x%08zX)\n",
++						 c2c_param->fixed_mw_sz);
++	}
++	DBG("\ttotal channels  = (%u)\n", c2c_param->channel_nr);
++	for (i = 0; i < c2c_param->channel_nr; i++) {
++		struct channel_param_t *param = NULL;
++		enum bulk_xfer_type xfer_mode = BULK_XFER_TYPE_NONE;
++
++		param = &(c2c_param->ch_params[i]);
++		xfer_mode = param->bulk_xfer_mode;
++		DBG("\t\t(%s)::\n", param->ch_name);
++		DBG("\t\t\tch_id     = (%u)\n", param->ch_id);
++		DBG("\t\t\talignment = (0x%x)\n", param->align);
++		DBG("\t\t\tnframes   = (0x%X) frame_size=(0x%08X)",
++				param->nframes, param->frame_sz);
++		DBG("\t\t\tnotification event::\n");
++		DBG("\t\t\t\ttype     = (%s)\n", (param->event_type == 0) ?
++					   ("NTB doorbell"):("syncpoint"));
++		DBG("\t\t\t\tprod_id  = (0x%02X)\n", param->prod_event_id);
++		DBG("\t\t\t\tcons_id  = (0x%02X)\n", param->cons_event_id);
++		DBG("\t\t\t\tstate_id = (0x%02X)\n", param->state_event_id);
++		if (xfer_mode == BULK_XFER_TYPE_NONE)
++			DBG("\t\t\tCPU xfer device\n");
++		else if (xfer_mode == BULK_XFER_TYPE_PRODUCER)
++			DBG("\t\t\tBulk Producer device\n");
++		else if (xfer_mode == BULK_XFER_TYPE_CONSUMER)
++			DBG("\t\t\tBulk Consumer device\n");
++		else if (xfer_mode == BULK_XFER_TYPE_PRODUCER_PCIE_READ)
++			DBG("\t\t\tBulk Producer device using PCIe read\n");
++		else if (xfer_mode == BULK_XFER_TYPE_CONSUMER_PCIE_READ)
++			DBG("\t\t\tBulk Consumer device using PCIe read\n");
++	}
++	DBG("C2C config file parsing ends\n");
++	DBG("\n");
++}
+diff --git a/drivers/misc/nvscic2c/link-mgmt.c b/drivers/misc/nvscic2c/link-mgmt.c
+new file mode 100644
+index 0000000..02dd887
+--- /dev/null
++++ b/drivers/misc/nvscic2c/link-mgmt.c
+@@ -0,0 +1,579 @@
++/*
++ * Copyright (c) 2019, NVIDIA CORPORATION.  All rights reserved.
++ *
++ * This program is free software; you can redistribute it and/or modify it
++ * under the terms and conditions of the GNU General Public License,
++ * version 2, as published by the Free Software Foundation.
++ *
++ * This program is distributed in the hope it will be useful, but WITHOUT
++ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
++ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for
++ * more details.
++ */
++
++#include "chip-to-chip.h"
++#include <linux/types.h>
++#include <linux/errno.h>
++#include <linux/slab.h>
++#include <linux/kernel.h>
++#include <linux/wait.h>
++#include <linux/mm.h>
++#include <linux/printk.h>
++#include <linux/string.h>
++#include <linux/delay.h>
++#include <linux/kthread.h>
++
++
++/* over-ride these so that:
++ * - we do not instantiate as a platform device.
++ * - we do not use NTB device for spews.
++ * - judiciously use 80 column limit.
++ * - add abstraction within module.
++ */
++#define ERR(...)	pr_err(MODULE_NAME": link-mgmt:\t" __VA_ARGS__)
++#define INFO(...)	pr_info(MODULE_NAME": link-mgmt:\t" __VA_ARGS__)
++#define DBG(...)	pr_debug(MODULE_NAME": link-mgmt:\t" __VA_ARGS__)
++
++
++/* wait/trigger period between two heart beats.*/
++#define HB_TIME_INTERVAL	(1000)
++
++/* wait for these many heart-beats to be missed
++ * to consider link down.
++ */
++#define HB_MISS_THRESH		(4)
++
++
++/*
++ * Overall context for the link-mgmt sub-module of nvscic2c module.
++ * This is to meet the expectation of link-mgmt abstraction.
++ */
++struct link_mgmt_ctx_t {
++	/* we export few functions, error out on them if this is not ready.*/
++	volatile bool initialised;
++
++	/* callback ops to propagate status changed event.*/
++	struct link_mgmt_ops ops;
++
++	/* link status - as received by NTB module - Read-only for link_mgmt.*/
++	atomic_t peer_status;
++
++	/* count of link_event recvd.*/
++	atomic_t hb_counter;
++
++	/* event miss count.*/
++	/* link monitor kthread identifier.*/
++	struct task_struct *monitor;
++	volatile bool monitor_shutdown;
++	struct completion monitor_shutdown_compl;
++
++	/* monitor thread keeps waiting for link events.*/
++	wait_queue_head_t monitor_waitq;
++
++	/* link trigger kthread identifier.*/
++	struct task_struct *trigger;
++	volatile bool trigger_shutdown;
++	struct completion trigger_shutdown_compl;
++
++	/* timer for trigger thread.*/
++	wait_queue_head_t trigger_waitq;
++
++	/* contains current link status for nvscic2c LKM and
++	 * nvscic2c user-space SW to refer to. Shall be mapped
++	 * in user-space, therefore must be PAGE_SIZE aligned.
++	 */
++	struct cpu_buff_t status_mem;
++};
++
++
++/* prototype.*/
++static int handle_status_changed(enum link_status status);
++
++/* prototype.*/
++static int start_hb_trigger_task(void);
++
++/* prototype.*/
++static int stop_hb_trigger_task(void);
++
++/* prototype.*/
++static int monitor_taskfn(void *arg);
++
++/* prototype.*/
++static int trigger_taskfn(void *arg);
++
++
++/* link_mgmt contxt. If not making it global here, add it to c2c_drv_ctx_t.*/
++static struct link_mgmt_ctx_t *link_ctx;
++
++
++/*
++ * Registered with NTB client abstraction(ntb-client.c). On every link
++ * event received by peer for NTB link, this callback shall be invoked.
++ *
++ * The status received in this callback is fed to monitor thread of
++ * link mgmt thread to decide change in link status.
++ */
++void link_mgmt_event_cb(enum link_status status)
++{
++	if ((!link_ctx)
++		|| (!link_ctx->initialised)) {
++		return;
++	}
++
++	/* we received a link event.*/
++	atomic_inc(&(link_ctx->hb_counter));
++	atomic_set(&(link_ctx->peer_status), status);
++
++	/* ask monitor thread to handle the hb.*/
++	wake_up_interruptible(&(link_ctx->monitor_waitq));
++}
++
++
++/*
++ * processing loop for link_mgmt module.
++ * The tasks starts by sending LINK_UP to remote peer.
++ * It then waits for a link event(UP or DOWN) from peer for HB_TIME_INTERVAL
++ * (ms). if:
++ * - Link event received within HB_TIME_INTERVAL, check for change in
++ *    link status w.r.t previous event.
++ *      - if changed, notify nvscic2c module to forward to channels.
++ *      - if no change, no action required.
++ * - No link event received for consecutive HB_MISS_THRESH iterations,
++ *   we deduce remote went away abruptly and forward to channels.
++ */
++static int monitor_taskfn(void *arg)
++{
++	int ret = 0;
++	uint32_t hb_missed = 0;
++	bool status_changed = false;
++	enum link_status peer_status = LINK_DOWN;
++	enum link_status self_status = LINK_DOWN;
++
++	DBG("starting link monitor thread\n");
++
++	/* start by signalling remote we are up.*/
++	ntb_client_set_link_status(LINK_UP);
++
++	while (!link_ctx->monitor_shutdown) {
++		/* wait for hb/time-out to occur. */
++		ret = wait_event_interruptible_timeout(link_ctx->monitor_waitq,
++					(atomic_read(&(link_ctx->hb_counter))
++					    || (link_ctx->monitor_shutdown)),
++					msecs_to_jiffies(HB_TIME_INTERVAL));
++		/* it comes out of wait in following cases:
++		 * - shutdown (locally done).
++		 * - link event/hb from remote.
++		 * - timed-out waiting for hb.
++		 * - unexpected error from wait_.
++		 */
++		if (link_ctx->monitor_shutdown) {
++			/* thread is exiting.*/
++			continue;
++		} else if (ret > 0) {
++			/* we got a link event / hb.*/
++			hb_missed = 0;
++			atomic_dec(&link_ctx->hb_counter);
++			peer_status = atomic_read(&(link_ctx->peer_status));
++			if (self_status != peer_status) {
++				self_status = peer_status;
++				status_changed = true;
++			}
++		} else if (ret == 0) {
++			/* timedout waiting for hb.*/
++			hb_missed++;
++			/* hb missed for long. set ourselves to LINK_DOWN. */
++			if (hb_missed >= HB_MISS_THRESH) {
++				hb_missed = 0;
++				if (self_status == LINK_UP) {
++					self_status = LINK_DOWN;
++					status_changed = true;
++				}
++			}
++		} else {
++			/* unhandled error.*/
++			ERR("link-monitor-thread: Unexpected error\n");
++			link_ctx->monitor_shutdown = true;
++			self_status = LINK_DOWN;
++			status_changed = true;
++		}
++
++		/* handle any status change.*/
++		if (status_changed == true) {
++			handle_status_changed(self_status);
++			status_changed = false;
++		}
++	}
++
++	/* signal all channels our link is down now.*/
++	handle_status_changed(LINK_DOWN);
++
++	/* signal remote we are going away.*/
++	ntb_client_set_link_status(LINK_DOWN);
++
++	DBG("exiting link monitor thread\n");
++
++	/* we do not use kthread_stop(), but wait on this.*/
++	complete(&(link_ctx->monitor_shutdown_compl));
++
++	return 0;
++}
++
++
++/*
++ * Thread function for triggering heart-beats to remote over NTB.
++ *
++ * This thread keeps itself block on struct completion for HB_TIME_INTERVAL
++ * milli-seconds and when wakes up, triggers remote/peer that it's Link
++ * is still UP.
++ *
++ * This task shall send link UP HB(s) at regular intervals. This has no
++ * intelligence but only to send HB events to remote. Therefore, when
++ * to start or stop is done by link monitor task.
++ */
++static int trigger_taskfn(void *arg)
++{
++	int ret = 0;
++
++	if (!link_ctx) {
++		ERR("(%s): link mgmt ctx not ready yet\n", __func__);
++		return -EINVAL;
++	}
++
++	DBG("starting link trigger thread\n");
++
++	while (!link_ctx->trigger_shutdown) {
++		/* wait for link event to occur. */
++		ret = wait_event_interruptible_timeout(link_ctx->trigger_waitq,
++						    link_ctx->trigger_shutdown,
++					   msecs_to_jiffies(HB_TIME_INTERVAL));
++		/* check for shutdown.*/
++		if (link_ctx->trigger_shutdown) {
++			/* thread is exiting.*/
++			continue;
++		}
++
++		/* timer timed-out, trigger hb.*/
++		ntb_client_set_link_status(LINK_UP);
++	}
++
++	DBG("exiting link trigger thread\n");
++
++	/* we do not use kthread_stop(), but wait on this.*/
++	complete(&(link_ctx->trigger_shutdown_compl));
++
++	return 0;
++}
++
++
++/*
++ * helper API to complete the required steps to handle change
++ * in NTB link status. We start with:
++ * - updating the status_mem which is shared with user-space SW.
++ * - notify the nvscic2c module about change in link status to
++ *   be forwarded to all channels.
++ * - start/stop link event trigger thread.
++ */
++static int handle_status_changed(enum link_status status)
++{
++	/* update global status memory.*/
++	*((enum link_status *)(link_ctx->status_mem.pva)) = status;
++
++	/* notify channels about change in link status.*/
++	if (link_ctx->ops.link_status_changed)
++		link_ctx->ops.link_status_changed(status, link_ctx->ops.ctx);
++
++	/* start or stop link trigger thread.*/
++	if (status == LINK_UP)
++		start_hb_trigger_task();
++	else
++		stop_hb_trigger_task();
++
++	return 0;
++}
++
++
++/*
++ * helper functions to start triggering the link heart-beat.
++ *
++ * This task shall send link UP HB(s) at regular intervals. This has no
++ * intelligence but only to send HB events to remote. Therefore, when
++ * to start or stop is done by link monitor task.
++ */
++static int start_hb_trigger_task(void)
++{
++	char thread_name[MAX_NAME_LEN] = {'\0'};
++
++	/* skipping check for link_ctx. internal api.*/
++
++	/* err: if running already.*/
++	if (link_ctx->trigger) {
++		ERR("trigger thread running already\n");
++		return -EINVAL;
++	}
++
++	/* start the link trigger thread.*/
++	snprintf(thread_name, (MAX_NAME_LEN - 1), "%s-link-trigger",
++		 MODULE_NAME);
++	link_ctx->trigger = kthread_run(trigger_taskfn, link_ctx,
++					thread_name);
++	if (IS_ERR_OR_NULL(link_ctx->trigger)) {
++		ERR("Failed to create link trigger task\n");
++		return PTR_ERR(link_ctx->trigger);
++	}
++
++	return 0;
++}
++
++
++/*
++ * Stop the link HB trigger task. Tyically, link monitor thread will
++ * stop the link trigger task on seeing that peer has went away.
++ * so that we do not send any more link UP events.
++ */
++static int stop_hb_trigger_task(void)
++{
++	int ret = 0;
++
++	/* skipping check for link_ctx. internal api.*/
++
++	/* stopped already.*/
++	if (IS_ERR_OR_NULL(link_ctx->trigger))
++		return ret;
++
++	/* initiate stop.*/
++	link_ctx->trigger_shutdown = true;
++	wake_up_interruptible(&(link_ctx->trigger_waitq));
++
++	/* wait for thread to complete.*/
++	wait_for_completion_interruptible(&(link_ctx->trigger_shutdown_compl));
++
++	/* prepare to start again when asked.*/
++	link_ctx->trigger = NULL;
++	link_ctx->trigger_shutdown = false;
++	reinit_completion(&(link_ctx->trigger_shutdown_compl));
++
++	DBG("link trigger thread stopped\n");
++
++	return ret;
++}
++
++
++/*
++ * Entry point for the link management sub-module/abstraction.
++ *
++ * Link mgmt abstraction keeps track of previous link state. If this
++ * changes to a different state than previous state, we invoke a callback
++ * nvscic2c module(module.c) registers with link_mgmt to notify all channels
++ * for link status change.
++ *
++ * On successful return (0), link monitoring thread would have been created
++ * which sends the first link UP event to remote and then waits for Link UP
++ * heart beats.
++ *
++ * There is a trigger thread which keeps sending link HB(s) which gets
++ * started only when we receive link UP event from remote.
++ *
++ * Also allocates the link status memory which nvscic2c dev exports to user-
++ * space via mmap.
++ *
++ * CAVEAT: nvscic2c dev nodes export mmap which shall map link status memory
++ * to user-space. We would start this link_mgmt once all devices are created
++ * but we also allocate this status memory when starting link_mgmt thread.
++ * Hence, there would be a small window where the nvscic2c devices have been
++ * setup and mmap is exported but link_mgmt module may not be ready yet.
++ */
++int link_mgmt_start(struct link_mgmt_ops *ops)
++{
++	int ret = 0;
++	struct cpu_buff_t status_mem = {0};
++	char thread_name[MAX_NAME_LEN] = {'\0'};
++
++	/* args check.*/
++	if ((!ops)
++		|| (!ops->link_status_changed)) {
++		ret = -EINVAL;
++		ERR("(%s): Invalid function args passed\n", __func__);
++		goto err;
++	}
++
++	/* if already instantiated.*/
++	if (link_ctx) {
++		ret = -EALREADY;
++		ERR("(%s): Link mgmt context already instantiated\n",
++			 __func__);
++		goto err;
++	}
++
++	/* start by allocating context.*/
++	link_ctx = kzalloc(sizeof(*link_ctx), GFP_KERNEL);
++	if (!link_ctx) {
++		ret = -ENOMEM;
++		ERR("Failed to allocate Link mgmt context.\n");
++		goto err;
++	}
++	link_ctx->ops.link_status_changed = ops->link_status_changed;
++	link_ctx->ops.ctx = ops->ctx;
++
++	/* allocate the link status memory which user-space SW can
++	 * map and read it to know the link status. Therefore allocate
++	 * worth PAGE_SIZE aligned.
++	 */
++	status_mem.size = PAGE_ALIGN(sizeof(enum link_status));
++	status_mem.pva  = kzalloc(status_mem.size, GFP_KERNEL);
++	if (!status_mem.pva) {
++		ret = -ENOMEM;
++		ERR("Failed to allocate link status memory.\n");
++		goto err;
++	}
++	*((enum link_status *)(status_mem.pva)) = LINK_DOWN;
++	status_mem.phys_addr = virt_to_phys(status_mem.pva);
++	memcpy(&(link_ctx->status_mem), &(status_mem), sizeof(status_mem));
++
++	/* initialise internals.*/
++	link_ctx->monitor_shutdown = false;
++	link_ctx->trigger_shutdown = false;
++	atomic_set(&(link_ctx->hb_counter), 0);
++	atomic_set(&(link_ctx->peer_status), LINK_DOWN);
++	init_waitqueue_head(&(link_ctx->monitor_waitq));
++	init_waitqueue_head(&(link_ctx->trigger_waitq));
++	init_completion(&(link_ctx->monitor_shutdown_compl));
++	init_completion(&(link_ctx->trigger_shutdown_compl));
++
++	/* start the link monitor thread.*/
++	snprintf(thread_name, (MAX_NAME_LEN - 1), "%s-link-moitor",
++		 MODULE_NAME);
++	link_ctx->monitor = kthread_run(monitor_taskfn, link_ctx,
++					thread_name);
++	if (IS_ERR_OR_NULL(link_ctx->monitor)) {
++		ERR("Failed to create link monitor task\n");
++		ret = PTR_ERR(link_ctx->monitor);
++		goto err;
++	}
++
++	/* all okay. */
++	link_ctx->initialised = true;
++	return ret;
++
++err:
++	link_mgmt_stop();
++	return ret;
++}
++
++
++/* exit point for link mgmt sub-module/abstraction.*/
++int link_mgmt_stop(void)
++{
++	int ret = 0;
++
++	if (!link_ctx)
++		return ret;
++
++	/* we are dying now, accept no more calls from other abstractions.*/
++	link_ctx->initialised = false;
++
++	/* stop link monitor thread.*/
++	if (!IS_ERR_OR_NULL(link_ctx->monitor)) {
++		/* initiate stop.*/
++		link_ctx->monitor_shutdown = true;
++		wake_up_interruptible(&(link_ctx->monitor_waitq));
++
++		/* wait for thread to complete.*/
++		wait_for_completion_interruptible(
++					&(link_ctx->monitor_shutdown_compl));
++		DBG("link monitor thread stopped\n");
++	}
++
++	kfree(link_ctx->status_mem.pva);
++	link_ctx->status_mem.pva = NULL;
++
++	kfree(link_ctx);
++	link_ctx = NULL;
++
++	return ret;
++}
++
++
++/*
++ * used by channel abstraction to query the current link status.
++ * for poll() implementation.
++ */
++enum link_status link_mgmt_get_link_status(void)
++{
++	enum link_status status = LINK_DOWN;
++
++	/* if called without calling link_mgmt_setup().*/
++	if ((!link_ctx)
++		|| (!link_ctx->initialised)) {
++		ERR("(%s): link mgmt ctx not ready yet\n", __func__);
++		return status;
++	}
++
++	status = *((enum link_status *)(link_ctx->status_mem.pva));
++	return status;
++}
++
++
++/*
++ * used by channel abstraction to query the size of the link status
++ * memory that shall be exported to userspace SW. for ioctl()/mmap()
++ * implementation.
++ *
++ * If nvscic2c module has called link_mgmt_release(), it must not
++ * refer link_status_mem anytime after that.
++ */
++size_t link_mgmt_get_status_mem_size(void)
++{
++	/* if called without calling link_mgmt_setup().*/
++	if ((!link_ctx)
++		|| (!link_ctx->initialised)) {
++		ERR("(%s): link mgmt ctx not ready yet\n", __func__);
++		return 0;
++	}
++
++	return link_ctx->status_mem.size;
++}
++
++
++/*
++ * helper function to mmap the link status memory for an nvscic2c
++ * dev node. This is required because the channel abstraction doesn't
++ * keep the link status memory credentials with itself.
++ *
++ * If nvscic2c module has called link_mgmt_release(), it must not
++ * refer link_status_mem anytime after that.
++ */
++int link_mgmt_mmap_status_mem(struct vm_area_struct *vma)
++{
++	int ret = 0;
++
++	/* args check.*/
++	if (!vma) {
++		ret = -EINVAL;
++		ERR("(%s): Function args invalid\n", __func__);
++		goto err;
++	}
++
++	/* if called without calling link_mgmt_setup().*/
++	if ((!link_ctx)
++		|| (!link_ctx->initialised)) {
++		ret = -EINVAL;
++		ERR("(%s): link mgmt ctx not ready yet\n", __func__);
++		goto err;
++	}
++
++	/* check again.*/
++	if ((vma->vm_end - vma->vm_start) != link_ctx->status_mem.size) {
++		ret = -EINVAL;
++		ERR("(%s): link_mgmt status mem mmap size mismatch\n",
++			 __func__);
++		goto err;
++	}
++
++	/* add remap_pfn_range(). here. */
++	ret = remap_pfn_range(vma, vma->vm_start,
++				PFN_DOWN(link_ctx->status_mem.phys_addr),
++				link_ctx->status_mem.size,
++				vma->vm_page_prot);
++err:
++	return ret;
++}
+diff --git a/drivers/misc/nvscic2c/module.c b/drivers/misc/nvscic2c/module.c
+new file mode 100644
+index 0000000..156a6de
+--- /dev/null
++++ b/drivers/misc/nvscic2c/module.c
+@@ -0,0 +1,304 @@
++/*
++ * Copyright (c) 2019, NVIDIA CORPORATION.  All rights reserved.
++ *
++ * This program is free software; you can redistribute it and/or modify it
++ * under the terms and conditions of the GNU General Public License,
++ * version 2, as published by the Free Software Foundation.
++ *
++ * This program is distributed in the hope it will be useful, but WITHOUT
++ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
++ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for
++ * more details.
++ */
++
++/*
++ * This is Chip-To-Chip(Host-To-Host) interconnect module built
++ * on MicroSemi/Microchip NTB bridge module. It is used to achieve data(small,
++ * bulk) transfers via CPU Reads/Writes or remote DMA Reads/Writes over PCIe
++ * wire from PCIe Host(x86) to another(Tegra). RP(Root-Port) <-> RootPort only.
++ *
++ * This sample is specifically written for NT mode support in Microsemi PLX
++ * switch hosted on NVIDIA DRIVE Platform. The NT-EP ports (both), domains must
++ * have the identical BAR sizes burnt.
++ */
++
++#include "chip-to-chip.h"
++#include <linux/init.h>
++#include <linux/kernel.h>
++#include <linux/module.h>
++#include <linux/slab.h>
++#include <linux/printk.h>
++
++
++#define DRIVER_LICENSE		"GPL v2"
++#define DRIVER_DESCRIPTION	"Host-To-Host data transfer module over PCIe"
++#define DRIVER_VERSION		"1.0"
++#define DRIVER_RELDATE		"January 2019"
++#define DRIVER_AUTHOR		"Nvidia Corporation"
++#define DRIVER_NAME		MODULE_NAME
++MODULE_DESCRIPTION(DRIVER_DESCRIPTION);
++MODULE_LICENSE(DRIVER_LICENSE);
++MODULE_VERSION(DRIVER_VERSION);
++MODULE_AUTHOR(DRIVER_AUTHOR);
++
++/*
++ * module parameter that user can supply for the reserved physical address
++ * for PCIe shared memory. - This can also be provided in config.c but
++ * if provided here shall over-ride the value given in c2c_config.
++ *
++ * ASSUMING THIS WAY IS WHEN PLATFORM DOESN'T SUPPORT IOMMU.
++ */
++static ulong fixed_mw_addr;
++module_param(fixed_mw_addr, ulong, 0644);
++MODULE_PARM_DESC(fixed_mw_addr,
++	"Physical address reserved for PCIe shared mem on BAR4");
++
++/* module parameter for the size that user can give for reserved physical
++ * memory. - This can also be provided in config.c but
++ * if provided here shall over-ride the value given in c2c_config.
++ *
++ * ASSUMING THIS WAY IS WHEN PLATFORM DOESN'T SUPPORT IOMMU.
++ */
++static ulong fixed_mw_size;
++module_param(fixed_mw_size, ulong, 0644);
++MODULE_PARM_DESC(fixed_mw_size,
++	"Size of reserved memory for PCIe shared mem on BAR4");
++
++
++/* over-ride these so that:
++ * - we do not instantiate as a platform device.
++ * - we do not use NTB device for spews.
++ * - judiciously use 80 column limit.
++ * - add abstraction within module.
++ */
++#define ERR(...)	pr_err(MODULE_NAME": module:\t" __VA_ARGS__)
++#define INFO(...)	pr_info(MODULE_NAME": module:\t" __VA_ARGS__)
++#define DBG(...)	pr_debug(MODULE_NAME": module:\t" __VA_ARGS__)
++
++
++/* Global nvscic2c module/driver context. */
++static struct c2c_drv_ctx_t *drv_ctx;
++
++
++/*
++ * Debug only. Print Rx(Self memory) PCIe shared memory
++ * and Tx(Peer memory)-PCIe aperture props.
++ */
++static void print_mem_info(struct dma_buff_t *self_mem,
++				struct pci_mmio_t *peer_mem)
++{
++	if ((self_mem != NULL)
++		&& (peer_mem != NULL)) {
++		DBG("\n");
++		DBG("Total Peer-memory: Tx memory:\n");
++		DBG("\t\taper:(%pa[p])\n", &(peer_mem->aper));
++		DBG("\t\tsize:(0x%016zx)\n", peer_mem->size);
++
++		DBG("Total Self-memory: Rx memory:\n");
++		DBG("\t\tiova:(%pa[d])\n", &(self_mem->dma_handle));
++		DBG("\t\tsize:(0x%016zx)\n", self_mem->size);
++		DBG("\n");
++	}
++}
++
++
++/*
++ * callback nvscic2c module registers with link_mgmt abstraction
++ * to be invoked everytime NTB link status is changed. On getting
++ * invoked we forward it to channel abstraction, so that each channel
++ * can check the NTB link status in it's poll() implementation.
++ */
++static void link_status_changed(enum link_status status, void *ctx)
++{
++	channel_link_event(status);
++}
++
++
++/* entry point for the driver/module.
++ * - We can work withot NTB driver with remote mempory addresses available,
++ * For E.g: R.P <-> E.P with propietary notification mechanism and therefore,
++ * our probe is not called from NTB driver so that we can remove NTB dependency
++ * easily.
++ */
++static int module_probe(void)
++{
++	int ret = 0;
++	struct c2c_param_t *c2c_param = NULL;
++	struct link_mgmt_ops link_ops = {0};
++
++	DBG("(%s): Entering\n", __func__);
++
++	/* start by allocating the global driver ctx.*/
++	drv_ctx = kzalloc(sizeof(*drv_ctx), GFP_KERNEL);
++	if (drv_ctx == NULL) {
++		ret = -ENOMEM;
++		ERR("Failed to allocate driver ctx\n");
++		goto err_alloc;
++	}
++	c2c_param = &(drv_ctx->c2c_param);
++
++	/* parse the configurable options for c2c module: channels,
++	 * fixed memory, etc.
++	 */
++	ret = config_parse(c2c_param);
++	if (ret != 0) {
++		ERR("Failed to parse c2c module config options.\n");
++		goto err_config;
++	}
++
++	/* if user had provided fixed physical address as mw backing,
++	 * over-ride the same config provided in config.c
++	 */
++	if ((fixed_mw_addr >= 0x80000000)
++		&& (fixed_mw_size)) {
++		INFO("Using (0x%08lx+0x%08zx) for NTB PCIe shared mw\n",
++			fixed_mw_addr, fixed_mw_size);
++
++		c2c_param->fixed_mw_addr  = fixed_mw_addr;
++		c2c_param->fixed_mw_sz    = fixed_mw_size;
++		c2c_param->use_fixed_addr = true;
++	}
++
++
++	/* if no enabled C2C channels were enabled.*/
++	if (c2c_param->channel_nr <= 0) {
++		ret = -EINVAL;
++		ERR("No C2C enabled channels parsed in config.c. Exiting\n");
++		goto err_ch_nr;
++	}
++
++	/* Window size for fixed addresses an min should be aligned to
++	 * PAGE_SIZE to fragment into nvscic2c channels on PAGE_SIZE
++	 * boundaries.
++	 */
++	if ((c2c_param->use_fixed_addr)
++		&& (c2c_param->fixed_mw_sz < c2c_param->req_mw_sz)) {
++		ret = -ENOMEM;
++		ERR("Fixed mw sz:(0x%08zx) less than requested:(0x%08zx).\n",
++			c2c_param->fixed_mw_sz, c2c_param->req_mw_sz);
++		goto err_fixed_sz;
++	}
++
++	/* register with NTB module as NTB client.
++	 * we register and wait for probe to get called to isolate
++	 * NTB dependency.
++	 */
++	ret = ntb_client_register(drv_ctx);
++	if (ret != 0x0) {
++		ERR("Failed to register nvscic2c as NTB client\n");
++		goto err_ntb_register;
++	}
++
++	/* query the overall PCIe rx(PCIe shared mem) and tx(PCIe aperture)
++	 * memory from ntb client. We have this call if we had to work without
++	 * NTB and use EP BAR address directly.
++	 */
++	ret = ntb_client_query_mem_info(&(drv_ctx->self_mem),
++					&(drv_ctx->peer_mem));
++	if (ret) {
++		ERR("Failed to query self and peer mem windows\n");
++		goto err_query_mem;
++	}
++	print_mem_info(&(drv_ctx->self_mem), &(drv_ctx->peer_mem));
++
++	/* create the nvscic2c devices now.*/
++	ret = channel_setup_devices(drv_ctx);
++	if (ret) {
++		ERR("Failed to setup the nvscic2c devices\n");
++		goto err_devices;
++	}
++
++	/* register with link management abstration, we should expect
++	 * callback on every link state change. This sends the first
++	 * NTB link UP to remote also.
++	 */
++	link_ops.link_status_changed = link_status_changed;
++	ret = link_mgmt_start(&(link_ops));
++	if (ret) {
++		ERR("Failed to initialise link_mgmt abstraction\n");
++		goto err_link;
++	}
++
++	DBG("(%s): Loaded module\n", __func__);
++	return ret;
++
++err_link:
++	channel_release_devices(drv_ctx);
++
++err_devices:
++err_query_mem:
++	ntb_client_unregister(drv_ctx);
++
++err_ntb_register:
++err_fixed_sz:
++err_ch_nr:
++	config_release(&(drv_ctx->c2c_param));
++
++err_config:
++	kfree(drv_ctx);
++	drv_ctx = NULL;
++
++err_alloc:
++	DBG("(%s): Error: Exiting\n", __func__);
++	return ret;
++}
++
++
++/* exit point for the driver/module.*/
++static int module_remove(void)
++{
++	int ret = 0;
++
++	DBG("(%s): Entering\n", __func__);
++
++	if (drv_ctx == NULL) {
++		DBG("(%s): Exiting\n", __func__);
++		return ret;
++	}
++
++	/* This signals LINK_DOWN to peer, must be first call. */
++	link_mgmt_stop();
++
++	/* release the channel devices.*/
++	channel_release_devices(drv_ctx);
++
++	/* deregister as NTB client.*/
++	ntb_client_unregister(drv_ctx);
++
++	/* release the config options.*/
++	config_release(&(drv_ctx->c2c_param));
++
++	kfree(drv_ctx);
++	drv_ctx = NULL;
++
++	DBG("(%s): Exiting\n", __func__);
++	return ret;
++}
++
++
++/*
++ * for it to be loadable, it must be loaded only after
++ * ntb, ntb_hw_switchtec modules have been loaded successfully.
++ */
++static int __init nvscic2c_init(void)
++{
++	int ret = 0;
++
++	ret = module_probe();
++	return ret;
++}
++
++
++#if IS_MODULE(CONFIG_NVSCIC2C)
++static void __exit nvscic2c_exit(void)
++{
++	DBG("(%s): Entering\n", __func__);
++	module_remove();
++	DBG("(%s): Exiting\n", __func__);
++}
++
++module_init(nvscic2c_init);
++module_exit(nvscic2c_exit);
++#else
++late_initcall(nvscic2c_init);
++#endif
+diff --git a/drivers/misc/nvscic2c/ntb-client.c b/drivers/misc/nvscic2c/ntb-client.c
+new file mode 100644
+index 0000000..fca7681
+--- /dev/null
++++ b/drivers/misc/nvscic2c/ntb-client.c
+@@ -0,0 +1,744 @@
++/*
++ * Copyright (c) 2019, NVIDIA CORPORATION.  All rights reserved.
++ *
++ * This program is free software; you can redistribute it and/or modify it
++ * under the terms and conditions of the GNU General Public License,
++ * version 2, as published by the Free Software Foundation.
++ *
++ * This program is distributed in the hope it will be useful, but WITHOUT
++ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
++ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for
++ * more details.
++ */
++
++#include "chip-to-chip.h"
++#include <linux/types.h>
++#include <linux/errno.h>
++#include <linux/slab.h>
++#include <linux/kernel.h>
++#include <linux/kthread.h>
++#include <linux/pci.h>
++#include <linux/wait.h>
++#include <linux/completion.h>
++#include <linux/ntb.h>
++#include <linux/version.h>
++#include <linux/printk.h>
++
++/*
++ * Of the capabilities of NTB, we do not use:
++ * - SPAD (self, peer, rd/wr both)
++ * - Peer DB read.
++ * - LUT for C2C data (NTB internally may still be using LUT)
++ * - Based on NTB == (k-4.15.0.39-generic || k-4.9-tegra)
++ */
++
++
++/* over-ride these so that:
++ * - we do not instantiate as a platform device.
++ * - we do not use NTB device for spews.
++ * - judiciously use 80 column limit.
++ * - add abstraction within module.
++ */
++#define ERR(...)	pr_err(MODULE_NAME": ntb-client:\t" __VA_ARGS__)
++#define INFO(...)	pr_info(MODULE_NAME": ntb-client:\t" __VA_ARGS__)
++#define DBG(...)	pr_debug(MODULE_NAME": ntb-client:\t" __VA_ARGS__)
++
++
++/* Switchtec NTB port from MicroSemi (and useCase_04.pmc) has maximum
++ * 2 memory windows (ID:0 on BAR2 and ID:1 on BAR4). Memory Window:0 will
++ * have first 2MB (32 LUT * 64k) reserved. We can still use Memory Window:1
++ * completely for C2C channel's data and control information.
++ */
++#define DATA_MW_ID	(1)
++
++
++/*
++ * ntb_client_t
++ *
++ * Internal Private data structure as NTB client. ntb_client_register()
++ * would not accept any driver context. Therefore, we allocate a minimal
++ * NTB client context here which contains backreference to driver context
++ * nvscic2c and pass it around as needed.
++ */
++struct ntb_client_t {
++	/* we our NTB client driver. For registeration with NTB driver. */
++	struct ntb_dev *ntbdev;
++
++	/* for async probe completion before we return back
++	 * to nvscic2c probe, NTB probe should be completed.
++	 */
++	struct completion probe_cpl;
++
++	/* size of mw requested by nvscic2c driver(config.c or DT).
++	 * proportional to channels supported.
++	 */
++	size_t req_mw_sz;
++
++	/* allowed doorbells as queried from NTB. */
++	uint32_t db_valid_mask;
++
++	/* Receive area: PCIe shared mem. Peer's Rd/Wr reflect here. */
++	struct dma_buff_t self_mem;
++
++	/* Transmit area: PCIe aperture. Self's Rd/Wr to Peer go via this.*/
++	struct pci_mmio_t peer_mem;
++
++	/* fixed physical address to be used for setting up PCIe shared mem.
++	 * Parameter given while loading module shall over-ride the same
++	 * setting provided in config.c file.
++	 */
++	uint64_t fixed_mw_addr;
++	size_t fixed_mw_sz;
++	bool use_fixed_addr;
++};
++
++
++/*
++ * NTB client context. We could have allocated in
++ * ntb client driver probe(), but we need to associate c2c driver context
++ * with ntb client driver. NTB driver doesn't accept any ctx during
++ * registration. Hence we need this global here.
++ */
++static struct ntb_client_t *ntb_ctx;
++
++
++/*
++ * Wrapper over corresponding NTB api, added to maintain abstraction:
++ * channel functionality doesn't call directly into NTB apis
++ * but only via ntb-client.
++ */
++int ntb_client_db_vector_count(void)
++{
++	if ((!ntb_ctx)
++		|| (!ntb_ctx->ntbdev)) {
++		ERR("(%s): ntb client not ready\n", __func__);
++		return -EINVAL;
++	}
++
++	return ntb_db_vector_count(ntb_ctx->ntbdev);
++}
++
++
++/*
++ * Wrapper over corresponding NTB api, added to maintain abstraction:
++ * channel functionality doesn't call directly into NTB apis
++ * but only via ntb-client.
++ */
++int ntb_client_db_set_mask(uint64_t db_bits)
++{
++	if ((!ntb_ctx)
++		|| (!ntb_ctx->ntbdev)) {
++		ERR("(%s): ntb client not ready\n", __func__);
++		return -EINVAL;
++	}
++
++	return ntb_db_set_mask(ntb_ctx->ntbdev, db_bits);
++}
++
++
++/*
++ * Wrapper over corresponding NTB api, added to maintain abstraction:
++ * channel functionality doesn't call directly into NTB apis
++ * but only via ntb-client.
++ */
++int ntb_client_db_clear_mask(uint64_t db_bits)
++{
++	if ((!ntb_ctx)
++		|| (!ntb_ctx->ntbdev)) {
++		ERR("(%s): ntb client not ready\n", __func__);
++		return -EINVAL;
++	}
++
++	return ntb_db_clear_mask(ntb_ctx->ntbdev, db_bits);
++}
++
++
++/*
++ * Wrapper over corresponding NTB api, added to maintain abstraction:
++ * channel functionality doesn't call directly into NTB apis
++ * but only via ntb-client.
++ */
++int ntb_client_db_clear(uint64_t db_bits)
++{
++	if ((!ntb_ctx)
++		|| (!ntb_ctx->ntbdev)) {
++		ERR("(%s): ntb client not ready\n", __func__);
++		return -EINVAL;
++	}
++
++	return ntb_db_clear(ntb_ctx->ntbdev, db_bits);
++}
++
++
++/*
++ * Wrapper over corresponding NTB api, added to maintain abstraction:
++ * channel functionality doesn't call directly into NTB apis
++ * but only via ntb-client.
++ */
++int ntb_client_peer_db_set(uint64_t db_bits)
++{
++	if ((!ntb_ctx)
++		|| (!ntb_ctx->ntbdev)) {
++		ERR("(%s): ntb client not ready\n", __func__);
++		return -EINVAL;
++	}
++
++	return ntb_peer_db_set(ntb_ctx->ntbdev, db_bits);
++}
++
++
++/*
++ * This function allows nvscic2c driver to set the link state as
++ * UP(true) or DOWN(false) when the NTB client driver was registered properly.
++ *
++ * Expected use is, to set the link to TRUE when nvscic2c is done setup of
++ * all c2c channels and is ready to exchange data.
++ *
++ * true: link up, false otherwise.
++ */
++int ntb_client_set_link_status(enum link_status status)
++{
++	if ((!ntb_ctx)
++		|| (!ntb_ctx->ntbdev)) {
++		ERR("(%s): ntb client not ready\n", __func__);
++		return -EINVAL;
++	}
++
++	if (status == LINK_UP) {
++		ntb_link_enable(ntb_ctx->ntbdev,
++				NTB_SPEED_AUTO, NTB_WIDTH_AUTO);
++	} else {
++		ntb_link_disable(ntb_ctx->ntbdev);
++	}
++
++	return 0;
++}
++
++
++/*
++ * Export nvscic2c(channel-cdev.c) dev node portion of self memory:
++ * Rx memory to userspace via mmap() call. Reason for this implementation
++ * being, if PCIe shared mem was allocated using dma-buff apis, channel
++ * abstraction would not have ntbdev to do mmap for dma buffer. Also,
++ * channel doesn't if fixed address(iommu=off) is being used.
++ *
++ * If nvscic2c module has called link_mgmt_release(), it must not
++ * refer link_status_mem anytime after that.
++ */
++int ntb_client_mmap_self_mem(struct vm_area_struct *vma,
++				struct dma_buff_t *self_mem)
++{
++	/* args check.*/
++	if ((!vma)
++		|| (!self_mem)) {
++		ERR("(%s): Function args invalid\n", __func__);
++		return -EINVAL;
++	}
++
++	/* if called without ntb client registered.*/
++	if ((!ntb_ctx)
++		|| (!ntb_ctx->ntbdev)) {
++		ERR("(%s): ntb client not ready\n", __func__);
++		return -EINVAL;
++	}
++
++	/* ntb-client doesn't know the size of rx memory of channel,
++	 * trust channel-cdev.c to have done the mmap size validation.
++	 */
++	if (ntb_ctx->use_fixed_addr) {
++		return remap_pfn_range(vma, vma->vm_start,
++				      PFN_DOWN(self_mem->dma_handle),
++				      self_mem->size,
++				      vma->vm_page_prot);
++	} else {
++		/* size of channel to be mapped is calculated by dma_ api
++		 * using vma_pages(): vma->vm_end - vma->vm_start.
++		 */
++		vma->vm_pgoff = ((self_mem->dma_handle
++				   - ntb_ctx->self_mem.dma_handle)
++				  >> (PAGE_SHIFT)
++				);
++		return dma_mmap_coherent(&(ntb_ctx->ntbdev->pdev->dev),
++					 vma,
++					 ntb_ctx->self_mem.pva,
++					 ntb_ctx->self_mem.dma_handle,
++					 ntb_ctx->self_mem.size);
++	}
++
++	return -EINVAL;
++}
++
++
++/* Doorbell event/callback from NT driver. */
++static void db_event(void *ctx, int vec)
++{
++	struct ntb_client_t *ntb_ctx = NULL;
++
++	if (!ctx)
++		return;
++	ntb_ctx = (struct ntb_client_t *)(ctx);
++
++	//DBG("DB Event Handler, DB: (%d)\n", vec);
++
++	/* pass on the channel abstraction to handle event.
++	 * this is not clean, as we didn't register this CB
++	 * with ntb-client.c. This is just calling into assuming
++	 * channels must be up when first DB vec comes.
++	 */
++	channel_db_event(vec);
++}
++
++
++/*
++ * NTB device driver would raise this callback whenever there is change
++ * in link status(up->down, down->up).
++ *
++ * We expect this to come only when NTB client driver has registered with
++ * NTB driver, therefore skipping all validations.
++ *
++ * This information would be vital to nvscic2c NTB LINK MANAGEMENT THREAD.
++ */
++static void link_event(void *ctx)
++{
++	struct ntb_client_t *ntb_ctx = NULL;
++	enum ntb_speed speed = NTB_SPEED_AUTO;
++	enum ntb_width width = NTB_WIDTH_AUTO;
++	int up = 0;
++
++	if (ctx == NULL)
++		return;
++	ntb_ctx = (struct ntb_client_t *)(ctx);
++
++	up = ntb_link_is_up(ntb_ctx->ntbdev, &speed, &width);
++
++	//DBG("link is %s speed %d width %d\n",
++	//     (up) ? ("up") : ("down"), speed, width);
++
++	if (up)
++		link_mgmt_event_cb(LINK_UP);
++	else
++		link_mgmt_event_cb(LINK_DOWN);
++}
++
++
++/* event callbacks registered with NTB driver.
++ * for every Doorbell triggered.
++ * for NTB link going up/down.
++ */
++static const struct ntb_ctx_ops client_ops = {
++	.link_event = link_event,
++	.db_event = db_event,
++};
++
++
++/*
++ * Private to NTB client driver.
++ *
++ * This function is probe for NTB client driver.
++ * Invoked by NTB device driver during NTB client registration.
++ * Sequence: ntb_client_register()->ntb_register_client()->
++ *		ntb_client_probe().
++ *
++ * Here we go over the memory window of our intereset (mw:1) and
++ * allocate a physical backing for mw:1, we also map the PCIe
++ * aperture for the mw:1 for tx purpose.
++ *
++ * Assumption is BOTH NT-EP ports have same BAR4/5 size settings.
++ */
++static int ntb_client_probe(struct ntb_client *self,
++				 struct ntb_dev *ntb)
++{
++	int ret = 0, mw_count = 0;
++	resource_size_t win_size = 0x0;
++	phys_addr_t base = 0x0;
++	int db_vecs = 0, db_read_mask = 0x0;
++
++	if (!ntb_ctx) {
++		ret = -EINVAL;
++		ERR("Invaldid ntb client ctx\n");
++		goto err;
++	}
++	ntb_ctx->ntbdev = ntb;
++
++	/* query the available mw regions with NT port. */
++#if LINUX_VERSION_CODE < KERNEL_VERSION(4, 14, 0)
++	mw_count = ntb_mw_count(ntb_ctx->ntbdev);
++#else
++	mw_count = ntb_peer_mw_count(ntb_ctx->ntbdev);
++#endif
++	if (mw_count < (DATA_MW_ID + 1)) {
++		ret = -ENOMEM;
++		ERR("Required pcie memory window not found\n");
++		goto err_mw_count;
++	}
++
++	/* use WindowID:1 for sharing PCIe shared memory.*/
++	/* MW:1 can be extended to BAR size of our choice by extending the
++	 * max_limit in NTB driver. Even afte doing so, NTB doesn't allow
++	 * setting MW:0 size to be greater than 2MB. So, we use MW:1 for
++	 * data xfers.
++	 */
++#if LINUX_VERSION_CODE < KERNEL_VERSION(4, 14, 0)
++	ret = ntb_mw_get_range(ntb_ctx->ntbdev, DATA_MW_ID,
++				&(base), &(win_size), NULL, NULL);
++#else
++	ret = ntb_peer_mw_get_addr(ntb_ctx->ntbdev, DATA_MW_ID,
++				&(base), &(win_size));
++#endif
++	if (ret) {
++		ret = -ENOMEM;
++		ERR("Failed to query memory window, mw:%u\n", DATA_MW_ID);
++		goto err_mw_get_range;
++	}
++
++	/* the PCIe shared mem (or aperture) is less than requested. */
++	if (win_size < ntb_ctx->req_mw_sz) {
++		ret = -ENOMEM;
++		ERR("NTB PCIe memory window size less than required.\n");
++		goto err_mw_size_check;
++	}
++
++	/* if we have been asked to use fixed physical address. - x86_64
++	 * assuming we bypass swiotlb and intel iommu.
++	 * on x86_64 for 64MB space, we get message SWIOTLB out of space.
++	 *
++	 * Ideally, we would like each nvscic2c channel to request and
++	 * map their own view of this memory.
++	 */
++	if (ntb_ctx->use_fixed_addr) {
++		/* stake claim on this memory.*/
++		if (!(request_mem_region(ntb_ctx->fixed_mw_addr,
++					 ntb_ctx->req_mw_sz,
++					 MODULE_NAME))) {
++			ret = -EBUSY;
++			ERR("Self Mem:(%pa[d])+(0x%08zx) already in use\n",
++				&(ntb_ctx->self_mem.dma_handle),
++				ntb_ctx->self_mem.size);
++			goto err_self_busy;
++		}
++		ntb_ctx->self_mem.size       = ntb_ctx->req_mw_sz;
++		ntb_ctx->self_mem.dma_handle = ntb_ctx->fixed_mw_addr;
++	} else {
++		/* use ntb(pcie) dev to allocate memory.*/
++		ntb_ctx->self_mem.size = ntb_ctx->req_mw_sz;
++		ntb_ctx->self_mem.pva  = dma_zalloc_coherent(
++						&(ntb_ctx->ntbdev->pdev->dev),
++						ntb_ctx->self_mem.size,
++						&(ntb_ctx->self_mem.dma_handle),
++						GFP_KERNEL);
++		if (!ntb_ctx->self_mem.pva) {
++			ret = -ENOMEM;
++			ERR("Window:(%u) of sz:(%08zx) alloc failed\n",
++					DATA_MW_ID, ntb_ctx->self_mem.size);
++			goto err_alloc;
++		}
++	}
++
++	/* the dma_handle must be aligned to size. NTB requirement.*/
++	if (!IS_ALIGNED(ntb_ctx->self_mem.dma_handle, ntb_ctx->self_mem.size)) {
++		ret = -ENOMEM;
++		ERR("iova:(%pa[d]) for mw not aligned to size:(0x%zx)\n",
++			&(ntb_ctx->self_mem.dma_handle),
++			ntb_ctx->self_mem.size);
++		goto err_align;
++	}
++
++	/* set up the actual translations so that peer's rd/wr fall here. */
++#if LINUX_VERSION_CODE < KERNEL_VERSION(4, 14, 0)
++	ret = ntb_mw_set_trans(ntb_ctx->ntbdev, DATA_MW_ID,
++				ntb_ctx->self_mem.dma_handle,
++				ntb_ctx->self_mem.size);
++#else
++	ret = ntb_mw_set_trans(ntb_ctx->ntbdev, NTB_DEF_PEER_IDX, DATA_MW_ID,
++				ntb_ctx->self_mem.dma_handle,
++				ntb_ctx->self_mem.size);
++#endif
++	if (ret != 0) {
++		ERR("Failed to map translation for mw:(%u)\n",
++			DATA_MW_ID);
++		goto err_set_trans;
++	}
++
++
++	/* Map peer memory for Tx xfers. LKM doesn't need this
++	 * as per current design, all writes - Channel state mgmt,
++	 * data xfers go from user-space SW. Nevertheless, we still do it.
++	 */
++	ntb_ctx->peer_mem.size = ntb_ctx->req_mw_sz;
++	ntb_ctx->peer_mem.aper = base;
++
++	/* stake claim on peer memory - Only that much as we require.*/
++	if (!(request_mem_region(ntb_ctx->peer_mem.aper,
++				 ntb_ctx->peer_mem.size,
++				 MODULE_NAME))) {
++		ret = -EBUSY;
++		ERR("Peer Mem:(%pa[p])+(0x%08zx) already in use\n",
++			&(ntb_ctx->peer_mem.aper), ntb_ctx->peer_mem.size);
++		goto err_peer_busy;
++	}
++
++	/* While starting, we disable all DBs. We will enable them as and when
++	 * channel requires.
++	 */
++	ntb_ctx->db_valid_mask = ntb_db_valid_mask(ntb_ctx->ntbdev);
++	ret = ntb_db_set_mask(ntb_ctx->ntbdev, ntb_ctx->db_valid_mask);
++	if (ret) {
++		ERR("Failed to mask all DB(s) events using:(0x%08X)\n",
++						ntb_ctx->db_valid_mask);
++		goto err_db;
++	}
++
++	/* check if the NTB device supports as many DB vectors as
++	 * supported DB's - Our nvscic2c design is based on 1 vector
++	 * per DB. This check is to be done once we set our interest of DBs
++	 * with NTB module.db vecs:[0, (supported - 1)]
++	 */
++	db_vecs      = ntb_db_vector_count(ntb_ctx->ntbdev);
++	db_read_mask = ntb_db_read_mask(ntb_ctx->ntbdev);
++	if (db_vecs < fls(db_read_mask)) {
++		ERR("Supported DB Vectors:(%d) not enough for db:(0x%08X)\n",
++			db_vecs, db_read_mask);
++		ERR("Require 1 DB MSI vector per DB\n");
++		goto err_db_vec;
++	}
++
++	/* register local ntb_client context with NTB driver. */
++	ret = ntb_set_ctx(ntb_ctx->ntbdev, ntb_ctx, &(client_ops));
++	if (ret)
++		goto err_set_ctx;
++
++	/* signal probe completed successfully. */
++	complete(&(ntb_ctx->probe_cpl));
++
++	/* NTB link will be enabled by nvscic2c driver.*/
++	return ret;
++
++err_set_ctx:
++err_db_vec:
++	ntb_db_set_mask(ntb_ctx->ntbdev, ntb_ctx->db_valid_mask);
++
++err_db:
++	release_mem_region(ntb_ctx->peer_mem.aper,
++			   ntb_ctx->peer_mem.size);
++
++err_peer_busy:
++#if LINUX_VERSION_CODE < KERNEL_VERSION(4, 14, 0)
++	ntb_mw_clear_trans(ntb_ctx->ntbdev, DATA_MW_ID);
++#else
++	ntb_mw_set_trans(ntb_ctx->ntbdev, NTB_DEF_PEER_IDX,
++			 DATA_MW_ID, 0x0, 0x0);
++#endif
++
++err_set_trans:
++err_align:
++	if ((ntb_ctx->use_fixed_addr)
++		&& (ntb_ctx->self_mem.dma_handle != 0)) {
++		release_mem_region(ntb_ctx->self_mem.dma_handle,
++				   ntb_ctx->self_mem.size);
++		ntb_ctx->self_mem.dma_handle = 0;
++	} else if (ntb_ctx->self_mem.pva) {
++		dma_free_coherent(&(ntb_ctx->ntbdev->pdev->dev),
++				ntb_ctx->self_mem.size,
++				ntb_ctx->self_mem.pva,
++				ntb_ctx->self_mem.dma_handle);
++		ntb_ctx->self_mem.pva = NULL;
++	}
++
++err_alloc:
++err_self_busy:
++err_mw_size_check:
++err_mw_get_range:
++err_mw_count:
++err:
++	ntb_ctx->ntbdev = NULL;
++
++	return ret;
++}
++
++
++/*
++ * Private to NTB client driver.
++ *
++ * This function does the reverse of probe() for NTB client driver.
++ * Sequence: ntb_client_unregister()->ntb_unregister_client()->
++ *		ntb_client_remove().
++ */
++static void ntb_client_remove(struct ntb_client *self,
++				 struct ntb_dev *ntb)
++{
++	if ((!ntb)
++		|| (ntb->ctx != ntb_ctx)
++		|| (!ntb_ctx->ntbdev)) {
++		return;
++	}
++
++	/* clear the NTB client setup.*/
++	ntb_db_set_mask(ntb_ctx->ntbdev, ntb_ctx->db_valid_mask);
++#if LINUX_VERSION_CODE < KERNEL_VERSION(4, 14, 0)
++	ntb_mw_clear_trans(ntb_ctx->ntbdev, DATA_MW_ID);
++#else
++	ntb_mw_set_trans(ntb_ctx->ntbdev, NTB_DEF_PEER_IDX,
++			 DATA_MW_ID, 0x0, 0x0);
++#endif
++	ntb_clear_ctx(ntb_ctx->ntbdev);
++
++	if (ntb_ctx->peer_mem.aper != 0) {
++		release_mem_region(ntb_ctx->peer_mem.aper,
++				   ntb_ctx->peer_mem.size);
++		ntb_ctx->peer_mem.aper  = 0;
++	}
++
++	if ((ntb_ctx->use_fixed_addr)
++		&& (ntb_ctx->self_mem.dma_handle != 0)) {
++		release_mem_region(ntb_ctx->self_mem.dma_handle,
++				 ntb_ctx->self_mem.size);
++		ntb_ctx->self_mem.dma_handle = 0;
++	} else if (ntb_ctx->self_mem.pva) {
++		dma_free_coherent(&(ntb_ctx->ntbdev->pdev->dev),
++				ntb_ctx->self_mem.size,
++				ntb_ctx->self_mem.pva,
++				ntb_ctx->self_mem.dma_handle);
++		ntb_ctx->self_mem.pva = NULL;
++	}
++
++	ntb_ctx->ntbdev = NULL;
++}
++
++
++/* for ntb client driver registration. */
++static struct ntb_client c2c_ntb_client = {
++	.ops = {
++		.probe = ntb_client_probe,
++		.remove = ntb_client_remove,
++	},
++};
++
++
++/*
++ * Interface for nvscic2c driver to register itself as a NTB client driver.
++ *
++ * Because, we expect nvscic2c window size requirements to be fulfilled
++ * by PCIe NT share memory, this function should be called after successful
++ * parsing of DT node of nvscic2c.
++ *
++ * Not thread-safe.
++ */
++int ntb_client_register(struct c2c_drv_ctx_t *drv_ctx)
++{
++	int ret = 0;
++
++	/* validation. */
++	if ((!drv_ctx)
++		|| (!drv_ctx->c2c_param.req_mw_sz)) {
++		ret = -EINVAL;
++		ERR("(%s): Invalid Params\n", __func__);
++		goto err;
++	}
++
++	/* should not be an exiting ntb client driver context already. */
++	if (ntb_ctx) {
++		ret = -EINVAL;
++		ERR("NTB client instantiated already\n");
++		goto err;
++	}
++
++	/* ntb client driver doesn't allow any context to be passed
++	 * to it while registration, it expects ntb client to allocate
++	 * context during it's own probe. Hence we allocate global ntb
++	 * context here and tag nvscic2c device to it.
++	 */
++	ntb_ctx = kzalloc(sizeof(struct ntb_client_t), GFP_KERNEL);
++	if (!ntb_ctx) {
++		ret = -ENOMEM;
++		ERR("Failed allocating ntb ctx.\n");
++		goto err;
++	}
++	ntb_ctx->req_mw_sz      = drv_ctx->c2c_param.req_mw_sz;
++	ntb_ctx->fixed_mw_addr  = drv_ctx->c2c_param.fixed_mw_addr;
++	ntb_ctx->fixed_mw_sz    = drv_ctx->c2c_param.fixed_mw_sz;
++	ntb_ctx->use_fixed_addr = drv_ctx->c2c_param.use_fixed_addr;
++
++	/* we wait on this for probe to complete. Initialise here.*/
++	init_completion(&(ntb_ctx->probe_cpl));
++
++	/* register for ntb client driver now. */
++	ret = ntb_register_client(&(c2c_ntb_client));
++	if (ret) {
++		ERR("Failed to register as NTB client\n");
++		goto err;
++	}
++
++	/* wait for PCIe NTB client async probe to complete because
++	 * nvscic2c driver will proceed ahead assuming probe() finished
++	 * if still not done. 2sec - sufficiently large.
++	 */
++	if (wait_for_completion_interruptible_timeout(&(ntb_ctx->probe_cpl),
++						msecs_to_jiffies(2000)) <= 0) {
++		ret = -ETIMEDOUT;
++		ERR("NTB client probe took long time, failed probably\n");
++		goto err;
++	}
++
++	/* all okay. */
++	return ret;
++
++err:
++	ntb_client_unregister(drv_ctx);
++	return ret;
++}
++
++
++/*
++ * Interface for nvscic2c driver to unload the NTB client driver.
++ *
++ * As a result the NTB link between two SoC's would go DOWN.
++ *
++ * Not thread-safe.
++ */
++void ntb_client_unregister(struct c2c_drv_ctx_t *drv_ctx)
++{
++	/* validation. */
++	if ((!drv_ctx)
++		|| (!ntb_ctx)) {
++		return;
++	}
++
++	ntb_unregister_client(&(c2c_ntb_client));
++
++	kfree(ntb_ctx);
++	ntb_ctx = NULL;
++}
++
++
++/*
++ * NTB client driver has a private context, query the pcie shared memory
++ * with the caller
++ *
++ * Can be called once NTB client is registered with NTB properly.
++ */
++int ntb_client_query_mem_info(struct dma_buff_t *self_mem,
++				struct pci_mmio_t *peer_mem)
++{
++	int ret = 0;
++
++	if ((!ntb_ctx)
++		|| (!ntb_ctx->ntbdev)) {
++		ret = -EINVAL;
++		pr_err("(%s): ntb client not ready\n", __func__);
++		goto err;
++	}
++
++	if ((!self_mem)
++		|| (!peer_mem)) {
++		ret = -EINVAL;
++		pr_info("(%s): Invalid Params\n", __func__);
++		goto err;
++	}
++
++	memcpy(self_mem, &(ntb_ctx->self_mem), sizeof(ntb_ctx->self_mem));
++	memcpy(peer_mem, &(ntb_ctx->peer_mem), sizeof(ntb_ctx->peer_mem));
++
++	return ret;
++err:
++	return ret;
++}
+diff --git a/include/linux/nvscic2c-ioctl.h b/include/linux/nvscic2c-ioctl.h
+new file mode 100644
+index 0000000..0d7bcdd
+--- /dev/null
++++ b/include/linux/nvscic2c-ioctl.h
+@@ -0,0 +1,152 @@
++/*
++ * Copyright (c) 2019, NVIDIA CORPORATION.  All rights reserved.
++ *
++ * This program is free software; you can redistribute it and/or modify it
++ * under the terms and conditions of the GNU General Public License,
++ * version 2, as published by the Free Software Foundation.
++ *
++ * This program is distributed in the hope it will be useful, but WITHOUT
++ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
++ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for
++ * more details.
++ */
++
++/*
++ * Interface for user-space sw to issue ioctl commands on the
++ * nvscic2c channel devices.
++ */
++#ifndef __NVSCIC2C_IOCTL_H__
++#define __NVSCIC2C_IOCTL_H__
++
++#include <linux/ioctl.h>
++#include <linux/types.h>
++
++#if !defined(__KERNEL__)
++#define __user
++#endif
++
++
++/* IOCTL magic number - seen available in ioctl-number.txt*/
++#define NVSCIC2C_IOCTL_MAGIC		0xC2
++
++
++/*
++ * User-space will not see the internal EVENT IDs.
++ * It will be masked behind these types. Data passed on by user-space in
++ * response to NOTIFY_REMOTE.
++ */
++
++/* send ioctl to trigger remote data channel.*/
++#define NVSCIC2C_NOTIFY_PRODUCER	(1 << 0)
++
++/* send ioctl to trigger remote data channel.*/
++#define NVSCIC2C_NOTIFY_CONSUMER	(1 << 1)
++
++/* send ioctl to trigger remote state mgmt.*/
++#define NVSCIC2C_NOTIFY_STATE		(1 << 2)
++
++
++/* Channel Device link status.*/
++enum link_status {
++	LINK_DOWN = 0,
++	LINK_UP,
++};
++
++
++/*
++ * bulk data transfer channels could be uni-directional. If there is no
++ * use-case for bi-directional data xfer but we still create a full-duplex
++ * single nvscic2c bulk channel, we end up leaving lot of PCIe shared memory
++ * being un-utilised.
++ */
++enum bulk_xfer_type {
++	/* it's not a bulk data xfer device but plain CPU channel.
++	 * data dir: Self<->Peer. (default, do not change this value).
++	 */
++	BULK_XFER_TYPE_NONE = 0,
++
++	/* This device supports only bulk transfer,
++	 * data dir: Peer->Self. We do write over PCIe for data.
++	 */
++	BULK_XFER_TYPE_PRODUCER,
++
++	/* This device supports only bulk transfer,
++	 * data dir: Self->Peer. We do write over PCIe for data.
++	 */
++	BULK_XFER_TYPE_CONSUMER,
++
++	/* This device supports only bulk transfer,
++	 * data dir: Peer->Self but we use Self capability to read
++	 * data over PCIe(typically DMA).
++	 */
++	BULK_XFER_TYPE_PRODUCER_PCIE_READ,
++
++	/* This device supports only bulk transfer,
++	 * data dir: Self->Peer but we use peer capability to read
++	 * data over PCIe(typically DMA).
++	 */
++	BULK_XFER_TYPE_CONSUMER_PCIE_READ,
++
++	/* Invalid.*/
++	BULK_XFER_TYPE_INVALID
++};
++
++
++/*
++ * memory segment available to be mapped by user. This will
++ * typically be returned from the device to user.
++ */
++struct mem_map {
++	/* would be one of the enum nvscic2c_mem_type.*/
++	uint32_t offset;
++
++	/* size of this memory type device would like user-space to map.*/
++	uint32_t size;
++};
++
++
++/* Data passed on user-space in response to GET_INFO.*/
++struct nvscic2c_info {
++	/* device peer and self memory fragmented in these many frames.*/
++	int8_t nframes;
++
++	/* device peer and self memory fragmented frames of these size.*/
++	uint32_t frame_sz;
++
++	/* This device supports only CPU transfer(small data) or Bulk data
++	 * xfer. If Bulk data, then is data going outside this device
++	 * or coming into this device.
++	 */
++	enum bulk_xfer_type xfer_type;
++
++	/* peer memory info.*/
++	struct mem_map peer;
++
++	/* self memory info. */
++	struct mem_map self;
++
++	/* control memory info.*/
++	struct mem_map ctrl;
++
++	/* NTB link memory info.*/
++	struct mem_map link;
++
++	/* platform: x86_64 or tegra - DEBUG ONLY.*/
++	char platform[24];
++};
++
++/* IOCTL definitions */
++
++/* query nvscic2c device properties for mapping it's memory in user-space.*/
++#define NVSCIC2C_IOCTL_GET_INFO \
++	_IOR(NVSCIC2C_IOCTL_MAGIC, 1, struct nvscic2c_info)
++
++/* notify remote(data or state)
++ * parameter must be one or a combination of NVSCIC2C_NOTIFY_*:
++ */
++#define NVSCIC2C_IOCTL_NOTIFY_REMOTE \
++	_IOW(NVSCIC2C_IOCTL_MAGIC, 2, uint8_t)
++
++#define NVSCIC2C_IOCTL_NUMBER_MAX 2
++
++#endif //__NVSCIC2C_IOCTL_H__
