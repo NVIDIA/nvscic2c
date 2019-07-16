@@ -1,0 +1,151 @@
+README for bringup of NvSciC2C on x86. It covers:
+ 1. Platform.
+ 2. Reserving contiguous memory(=64MB) for PCIe shared memory backing.
+ 3. NTB changes and auto-load of it's LKM(s).
+ 4. Setting up Kernel sources (on linux host machine) for NvSciC2C LKM build.
+ 5. Steps to insert NvSciC2C LKM on x86.
+ 6. Contact.
+
+
+ 1. Platform
+
+   NvSciC2C is Nvidia Propietary Chip-to-Chip SW communication protocol which
+   allows PCIe Root-Ports exchange
+     a. Low latency small packets via CPU transfers.
+     b. Bulk data packets via DMA transfers.
+   via NTB PCIe EndPoint over PCIe interface.
+
+   Supported platform is E3550 B01/B03 DDPX with Intel Xeon COMEX board hosted.
+   Supported PCIe topology is Xavier-A(Tegra) connected via PCIe-NT
+   (Non-Transparent Bridging)vEP to Intel Xeon(x86) COMEX.
+
+   Both Xavier-A(QNX) and Intel Xeon are supposed to have IOMMU=OFF for their
+   respective PCIe devices/EPs.
+
+   Supported SW Release(s):
+     a. Xavier-A: 5.1.3.0 DRIVE OS QNX with pct=d-av-q.
+     b. Intel Xeon: 18.04 LTS Ubuntu installation, kernel=4.15.0-45.48
+        (a.k.a 4.15.0-45-generic)
+
+   Ensure Intel Xeon has Ethernet Connectivity to move NvSciC2C(and dependent)
+   LKMs from host m/c to Intel Xeon.
+
+   Refer to Internal Confluence Page on E3550+ADLINK setup page or External
+   release notes for DDPX board bringup with Intel Xeon X86 COMEX.
+
+
+ 2. Reserving 'reserved memory' contiguous memory region
+
+   For Intel Xeon's NvSciC2C SW to receive bulk data from Xavier-A over PCIe and
+   with Intel IOMMU=OFF, large contiguous memory needs be exposed via NT-EP
+   direct memory window. This allows Xavier-A to pass it's produced bulk frames
+   (from camera, GFX, etc.) to Intel Xeon x86. To reserve such memory region,
+   use kernel boot-args: 'memmap'.
+
+   Physical address of this reserved memory region must be aligned to size of
+   the region. For e.g: if 64MB of reserved memory is required, it can be marked
+   reserved at 0x88000000(if not marked reserved already, else some other
+   address keeping the address alignment needs in-check).
+
+   NvSciC2C requires exactly 64MB block. This fixed address and size is passed
+   as module parameter to nvscic2c.ko (mentioned later.)
+
+   Steps:
+    a. Check the physical memory available for reservation
+        comex@ddpx-xeon:~$ dmesg | grep BIOS-e820
+
+    b. Reserve 64MB memory at 0x88000000 (if seen usable in (2)(a))
+        comex@ddpx-xeon:~$ sudo vi /etc/default/grub
+        - GRUB_CMDLINE_LINUX="console=ttyS4,115200 console=tty0"
+        + ##GRUB_CMDLINE_LINUX="console=ttyS4,115200 console=tty0"
+        + GRUB_CMDLINE_LINUX="console=ttyS4,115200 console=tty0 memmap=64M\\\$0x88000000"
+
+    c. Update the memmap option in current grub configuration
+        comex@ddpx-xeon:~$ sudo update-grub2
+
+    d. See the memmap option reflected in grub/boot
+        comex@ddpx-xeon:~$ vi /boot/grub/grub.cfg
+        [linux /boot/vmlinuz-4.15.0-39-generic root=/dev/sda2 ro console=ttyS4,115200 console=tty0 memmap=64M\$0x88000000 3]
+        comex@ddpx-xeon:~$ sudo reboot
+
+    e. Once rebooted, check kernel command line, physical memory should now be
+       marked persistent/reserved.
+
+
+ 3. NTB changes and auto-load of it's LKM(s).
+
+    a. For NvSciC2C, also a NTB client, memory window size(64MB) requirements
+       exceed the defaults NTB module support(2MB). Currently, this window size
+       is set to 64MB as explained in (2). We pass this size as LKM parameter
+       to NTB switchtec module while loading it manually. We recommend, users
+       to disable auto-load of NTB LKM(s): switchtec.ko, ntb.ko and
+       ntb_hw_switchtec.ko. How to manually load them is mentioned later.
+
+    b. Upstream NTB module, uses 1 MSI-X for all 28 supported DB, 1 MSI-X for
+       4 MSG registers. To conclusively deduce the DB index triggered by remote
+       we check each bit of the DB register each time resetting the set DB index
+       to zero. We have introduced a change in NTB upstream LKM under Kconfig:
+       NTB_LINK_MGMT, where we request for overall 32 MSI-X vectors to Intel
+       Xeon's PCIe sub-system and assign each of 28 DB and 4 MSG register a
+       distinct MSI-X vec.
+
+
+ 4. Setting up kernel sources for NvSciC2C LKM build.
+
+   NvSciC2C SW has two components: Loadable Kernel Module(LKM) and User-Space
+   Library(USL).
+
+   To build NvSciC2C LKM, on top of Ubuntu bionic kernel clone, we must apply
+   the NvSciC2C and dependent NTB Link MGMT patch and subsequently follow
+   standard process of BuildingYourOwnKernel ratified by Canonical.
+
+   The following steps can be done either on Intel Xeon or on Ubuntu host m/c.
+
+   Steps:
+    a. #### Clone the git repo.
+        comex@ddpx-xeon:~$ git clone git://kernel.ubuntu.com/ubuntu/ubuntu-bionic.git
+        comex@ddpx-xeon:~$ cd ubuntu-bionic/
+        comex@ddpx-xeon:~$ git checkout -b temp Ubuntu-4.15.0-45.48
+
+    b. ## Compile the objects into a separate directory.
+        comex@ddpx-xeon:~$ export KBUILD_OUTPUT=`pwd`/out
+
+    c. ### Fix a peculiar build error while making the kernel
+        comex@ddpx-xeon:~$ cp debian/scripts/retpoline-extract-one scripts/ubuntu-retpoline-extract-one
+
+    d. ### Apply the patches for nvscic2c LKM and it’s dependency
+        comex@ddpx-xeon:~$ git apply link_mgmt-4.15.0-45.48.patch
+        comex@ddpx-xeon:~$ git apply nvscic2c-4.15.0-45.48.patch
+
+    e. ### Enable the NvSciC2C modules as ‘m’ via menuconfig. This will also set the Kconfig: NTB_LINK_MGMT to ‘y’
+        comex@ddpx-xeon:~$ make SUBLEVEL=0 EXTRAVERSION=-45-generic menuconfig
+
+    f. ### Compile the kernel source. Set LOCALVERSION=”” to avoid magic version mismatch issue while inserting NvSciC2C and NTB LKM(s)
+        comex@ddpx-xeon:~$ make SUBLEVEL=0 EXTRAVERSION=-45-generic -j`getconf _NPROCESSORS_ONLN` LOCALVERSION=""
+
+
+ 5. Inserting NvSciC2C LKM manually.
+
+   Once the NvSciC2C LKM and NTB LKM(s) with NTB_LINK_MGMT='y' is compiled
+   following steps 3[a-f], we can insert these modules manually. If built
+   on host m/c, these must be copied to Intel Xeon file-system. These must
+   be inserted in the order listed here.
+
+   The NvSciC2C LKM params must be same as the reserved memory region
+   credentials reserved in step (2).
+
+   One can optionally add dyndbg=+p to each of these to have a verbose output.
+
+        comex@ddpx-xeon:~$ sudo insmod ntb.ko
+        comex@ddpx-xeon:~$ sudo insmod switchtec.ko
+        comex@ddpx-xeon:~$ sudo insmod ntb_hw_switchtec.ko max_mw_size=0x04000000
+        comex@ddpx-xeon:~$ sudo insmod nvscic2c.ko fixed_mw_addr=0x88000000 fixed_mw_size=0x04000000
+
+   nvscic2c.ko can take as long as 8sec to load. This is because we are
+   issuing memset() of reserved memory region in NO_CACHE mode.
+
+ 5. Contact:
+   Arihant Jejani <ajejani@nvidia.com>
+   Bob Johnston <BJohnston@nvidia.com>
+   Deepak Kumar Badgaiyan <dbadgaiyan@nvidia.com>
+   Tushar Padlikar <tpadlikar@nvidia.com>
