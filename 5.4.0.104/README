@@ -1,0 +1,89 @@
+README for bringup of NvSciC2c driver on x86. It covers:
+ 1. Platform.
+ 2. Build of NvSciC2c driver and its dependencies.
+ 3. NvSciC2c driver execution on x86.
+ 4. Contact.
+
+
+ 1. Platform
+    NvSciC2c is Nvidia proprietary Chip-to-Chip SW communication protocol which
+    allows exchange of data over PCIe Root-Port <-> Endpoint in the folliowing manner
+        a. Low latency small packets via CPU transfers.
+        b. Bulk data packets via DMA transfers.
+
+    Supported HW platforms:
+        a. 3rd generation scalable Intel Xeon with NVIDIA DRIVE-A100 Automotive GPU (optional)
+
+    Supported PCIe reference topology:
+        a. PCIe re-timers card P3722 is inserted into a X16 PCIe slot on Intel Xeon board
+        b. Interconnection Board P3713 is present in DRIVE AGX Devkit
+        c. miniSAS Port-B of P3713 is connected to miniSAS Port D of P3722 with a PCIe miniSAS cable
+
+    Supported SW Release and Configurations(s):
+        a. Ubuntu 20.04 LTS installation with kernel=5.4.0-104-generic
+        b. NVIDIA GPU Driver with version >= 510.73
+        c. The IOMMU should be enabled by having intel_iommu=on in kernel command
+
+ 2. Build NvSciC2c driver and its dependences.
+
+    2.1 Build and Install kernel 5.4.0-104-generic with IOMMU_DMA enabled:
+        NvSciC2c driver uses iommu APIs  to allocate iova, which is used for programming of DMA.
+        The IOMMU_DMA config that supports IOMMU agnostic DMA-mapping layer is currently diabled by default in
+        K5.4 and it needs to be enabled.
+
+        Steps to build Kernel 5.4: BuildingYourOwnKernel(https://wiki.ubuntu.com/Kernel/BuildYourOwnKernel)
+            a. Obtain the source for an Ubuntu release:
+               git clone git://kernel.ubuntu.com/ubuntu/ubuntu-focal.git
+            b. checkout the Ubuntu 5.4.0-104 tag
+               cd ubuntu-focal
+               git checkout tags/Ubuntu-5.4.0-104.118 -b your_branch
+            c. enable IOMMU_DMA by directly editing drivers/iommu/Kconfig and marking it "default y"
+               for the IOMMU_DMA section
+            d. Building the kernel
+               LANG=C fakeroot debian/rules clean
+               LANG=C fakeroot debian/rules binary-headers binary-generic
+            e. once built, install kernel deb files
+               sudo dpkg -i ../linux*5.4.0*.deb
+            g. set newly build image as default in grub
+               sudo vi /etc/default/grub
+               change GRUB_DEFAULT = "Advanced options for Ubuntu>Ubuntu, with Linux 5.4.0-104-generic"
+               set GRUB_CMDLINE_LINUX_DEFAULT="intel_iommu=on"
+               sudo update-grub
+               sudo reboot
+               On reboot, uname -r should show reflect the kernel version as:
+               5.4.0-104-generic
+
+    2.2  Steps to build NvSciC2c driver on top of K5.4 cloned in step 2.1:
+        a. Switch to the same branch created in step 2.1 or create a new branch
+           cd ubuntu-focal/drivers/misc/
+           git checkout your_branch
+        b. Apply the patches for NvSciC2c driver
+           git apply nvscic2c_Ubuntu_5.4.0-104-generic
+        c. Verify Module.symvers is present in /usr/src/nvidia-510.73, otherwise generate it manualy
+           cd /usr/src/nvidia-510.73
+           sudo make
+        d. Build NvSciC2c driver as an out-of-tree module
+           cd drivers/misc/nvscic2c-pcie
+           sudo make
+           sudo make install
+        e. To use the NvSciC2c driver without dGPU, build it using
+           sudo make -j DISABLE_GPU=1
+           sudo make install
+
+ 3.  NvSciC2c driver execution:
+
+   3.1 Detect AGX Orin as PCIe Endpoint
+
+      For NvSciC2c driver to be used on X86, the DRIVE AGX Orin should be detected as valid PCIe endpoint.
+      The details for Orin setup are captured in the DRIVE OS release documentation
+
+   3.2 Inserting NvSciC2c driver
+       Once the NvSciC2c driver is compiled by following the steps 2.2[a-d], it can be inserted into the kernel.
+       sudo modprobe nvscic2c-pcie-epc
+
+ 4. Contact:
+    Evan Shi <eshi@nvidia.com>
+    Chirantan <chirantan@nvidia.com>
+    Arihant Jejani <ajejani@nvidia.com>
+    Deepak Kumar Badgaiyan <dbadgaiyan@nvidia.com>
+    Bob Johnston <BJohnston@nvidia.com>
