@@ -139,13 +139,13 @@ index 000000000000..f86acdbc69f6
 +    Bob Johnston <BJohnston@nvidia.com>
 diff --git a/drivers/misc/nvscic2c-pcie/comm-channel.c b/drivers/misc/nvscic2c-pcie/comm-channel.c
 new file mode 100644
-index 000000000000..4e79e88b6a2d
+index 000000000000..4bfff8838adc
 --- /dev/null
 +++ b/drivers/misc/nvscic2c-pcie/comm-channel.c
-@@ -0,0 +1,721 @@
+@@ -0,0 +1,725 @@
 +// SPDX-License-Identifier: GPL-2.0+
 +/*
-+ * Copyright (c) 2022, NVIDIA CORPORATION.  All rights reserved.
++ * Copyright (c) 2022-2023, NVIDIA CORPORATION.  All rights reserved.
 + *
 + * This program is free software; you can redistribute it and/or modify it
 + * under the terms and conditions of the GNU General Public License,
@@ -529,9 +529,13 @@ index 000000000000..4e79e88b6a2d
 +free_sync_primitive(struct comm_channel_ctx_t *comm_ctx)
 +{
 +	struct syncpt_t *syncpt = NULL;
-+	struct pci_dev *pdev = pci_client_get_pci_dev(comm_ctx->pci_client_h);
++	struct pci_dev *pdev = NULL;
++
++	if (!comm_ctx)
++		return;
 +
 +	syncpt = &comm_ctx->syncpt;
++	pdev = pci_client_get_pci_dev(comm_ctx->pci_client_h);
 +
 +	if (syncpt->peer_mem.pva) {
 +		iounmap(syncpt->peer_mem.pva);
@@ -866,13 +870,13 @@ index 000000000000..4e79e88b6a2d
 +}
 diff --git a/drivers/misc/nvscic2c-pcie/comm-channel.h b/drivers/misc/nvscic2c-pcie/comm-channel.h
 new file mode 100644
-index 000000000000..3ba3c0237109
+index 000000000000..c2d7667ab23e
 --- /dev/null
 +++ b/drivers/misc/nvscic2c-pcie/comm-channel.h
 @@ -0,0 +1,126 @@
 +/* SPDX-License-Identifier: GPL-2.0+ */
 +/*
-+ * Copyright (c) 2022, NVIDIA CORPORATION.  All rights reserved.
++ * Copyright (c) 2022-2023, NVIDIA CORPORATION.  All rights reserved.
 + *
 + * This program is free software; you can redistribute it and/or modify it
 + * under the terms and conditions of the GNU General Public License,
@@ -998,13 +1002,13 @@ index 000000000000..3ba3c0237109
 +#endif //__COMM_CHANNEL_H__
 diff --git a/drivers/misc/nvscic2c-pcie/common.h b/drivers/misc/nvscic2c-pcie/common.h
 new file mode 100644
-index 000000000000..7410da1f69d9
+index 000000000000..02f4f5b26652
 --- /dev/null
 +++ b/drivers/misc/nvscic2c-pcie/common.h
 @@ -0,0 +1,223 @@
 +/* SPDX-License-Identifier: GPL-2.0+ */
 +/*
-+ * Copyright (c) 2022, NVIDIA CORPORATION.  All rights reserved.
++ * Copyright (c) 2022-2023, NVIDIA CORPORATION.  All rights reserved.
 + *
 + * This program is free software; you can redistribute it and/or modify it
 + * under the terms and conditions of the GNU General Public License,
@@ -1227,13 +1231,13 @@ index 000000000000..7410da1f69d9
 +#endif //__COMMON_H__
 diff --git a/drivers/misc/nvscic2c-pcie/config.c b/drivers/misc/nvscic2c-pcie/config.c
 new file mode 100644
-index 000000000000..328c8c0bd1fe
+index 000000000000..ebe6fa3b07e6
 --- /dev/null
 +++ b/drivers/misc/nvscic2c-pcie/config.c
 @@ -0,0 +1,90 @@
 +// SPDX-License-Identifier: GPL-2.0+
 +/*
-+ * Copyright (c) 2022, NVIDIA CORPORATION.  All rights reserved.
++ * Copyright (c) 2022-2023, NVIDIA CORPORATION.  All rights reserved.
 + *
 + * This program is free software; you can redistribute it and/or modify it
 + * under the terms and conditions of the GNU General Public License,
@@ -1323,13 +1327,13 @@ index 000000000000..328c8c0bd1fe
 +}
 diff --git a/drivers/misc/nvscic2c-pcie/config.h b/drivers/misc/nvscic2c-pcie/config.h
 new file mode 100644
-index 000000000000..6ea640c9a577
+index 000000000000..c1bb4735c00e
 --- /dev/null
 +++ b/drivers/misc/nvscic2c-pcie/config.h
-@@ -0,0 +1,49 @@
+@@ -0,0 +1,48 @@
 +/* SPDX-License-Identifier: GPL-2.0+ */
 +/*
-+ * Copyright (c) 2022, NVIDIA CORPORATION.  All rights reserved.
++ * Copyright (c) 2022-2023, NVIDIA CORPORATION.  All rights reserved.
 + *
 + * This program is free software; you can redistribute it and/or modify it
 + * under the terms and conditions of the GNU General Public License,
@@ -1375,16 +1379,15 @@ index 000000000000..6ea640c9a577
 +}
 +
 +#endif /* !NVSCIC2C_X86_PCIE_DT_H */
-+
 diff --git a/drivers/misc/nvscic2c-pcie/descriptor.h b/drivers/misc/nvscic2c-pcie/descriptor.h
 new file mode 100644
-index 000000000000..2ee56ee4ac4a
+index 000000000000..a32d6fd40b91
 --- /dev/null
 +++ b/drivers/misc/nvscic2c-pcie/descriptor.h
 @@ -0,0 +1,172 @@
 +/* SPDX-License-Identifier: GPL-2.0+ */
 +/*
-+ * Copyright (c) 2022, NVIDIA CORPORATION.  All rights reserved.
++ * Copyright (c) 2022-2023, NVIDIA CORPORATION.  All rights reserved.
 + *
 + * This program is free software; you can redistribute it and/or modify it
 + * under the terms and conditions of the GNU General Public License,
@@ -1556,13 +1559,13 @@ index 000000000000..2ee56ee4ac4a
 +#endif //__DESCRIPTOR_H__
 diff --git a/drivers/misc/nvscic2c-pcie/endpoint.c b/drivers/misc/nvscic2c-pcie/endpoint.c
 new file mode 100644
-index 000000000000..1a21edfa7c1d
+index 000000000000..d164d170c2b3
 --- /dev/null
 +++ b/drivers/misc/nvscic2c-pcie/endpoint.c
-@@ -0,0 +1,1015 @@
+@@ -0,0 +1,1016 @@
 +// SPDX-License-Identifier: GPL-2.0+
 +/*
-+ * Copyright (c) 2022, NVIDIA CORPORATION.  All rights reserved.
++ * Copyright (c) 2022-2023, NVIDIA CORPORATION.  All rights reserved.
 + *
 + * This program is free software; you can redistribute it and/or modify it
 + * under the terms and conditions of the GNU General Public License,
@@ -2096,12 +2099,13 @@ index 000000000000..1a21edfa7c1d
 +		    struct endpoint_t *endpoint)
 +{
 +	struct syncpt_t *syncpt = NULL;
-+	struct pci_dev *pdev = pci_client_get_pci_dev(endpoint->pci_client_h);
++	struct pci_dev *pdev = NULL;
 +
 +	if (!eps_ctx || !endpoint)
 +		return;
 +
 +	syncpt = &endpoint->syncpt;
++	pdev = pci_client_get_pci_dev(endpoint->pci_client_h);
 +
 +	if (syncpt->peer_mem.pva) {
 +		iounmap(syncpt->peer_mem.pva);
@@ -2577,13 +2581,13 @@ index 000000000000..1a21edfa7c1d
 +}
 diff --git a/drivers/misc/nvscic2c-pcie/endpoint.h b/drivers/misc/nvscic2c-pcie/endpoint.h
 new file mode 100644
-index 000000000000..379e809a7550
+index 000000000000..001bb24d2f10
 --- /dev/null
 +++ b/drivers/misc/nvscic2c-pcie/endpoint.h
 @@ -0,0 +1,46 @@
 +/* SPDX-License-Identifier: GPL-2.0+ */
 +/*
-+ * Copyright (c) 2022, NVIDIA CORPORATION.  All rights reserved.
++ * Copyright (c) 2022-2023, NVIDIA CORPORATION.  All rights reserved.
 + *
 + * This program is free software; you can redistribute it and/or modify it
 + * under the terms and conditions of the GNU General Public License,
@@ -2629,13 +2633,13 @@ index 000000000000..379e809a7550
 +#endif //__ENDPOINT_H__
 diff --git a/drivers/misc/nvscic2c-pcie/iova-mngr.c b/drivers/misc/nvscic2c-pcie/iova-mngr.c
 new file mode 100644
-index 000000000000..53b97641505a
+index 000000000000..73db0d6f61d2
 --- /dev/null
 +++ b/drivers/misc/nvscic2c-pcie/iova-mngr.c
 @@ -0,0 +1,393 @@
 +// SPDX-License-Identifier: GPL-2.0+
 +/*
-+ * Copyright (c) 2022, NVIDIA CORPORATION.  All rights reserved.
++ * Copyright (c) 2022-2023, NVIDIA CORPORATION.  All rights reserved.
 + *
 + * This program is free software; you can redistribute it and/or modify it
 + * under the terms and conditions of the GNU General Public License,
@@ -3028,13 +3032,13 @@ index 000000000000..53b97641505a
 +}
 diff --git a/drivers/misc/nvscic2c-pcie/iova-mngr.h b/drivers/misc/nvscic2c-pcie/iova-mngr.h
 new file mode 100644
-index 000000000000..a6fbd581afe4
+index 000000000000..df2ce6be7c33
 --- /dev/null
 +++ b/drivers/misc/nvscic2c-pcie/iova-mngr.h
 @@ -0,0 +1,72 @@
 +/* SPDX-License-Identifier: GPL-2.0+ */
 +/*
-+ * Copyright (c) 2022, NVIDIA CORPORATION.  All rights reserved.
++ * Copyright (c) 2022-2023, NVIDIA CORPORATION.  All rights reserved.
 + *
 + * This program is free software; you can redistribute it and/or modify it
 + * under the terms and conditions of the GNU General Public License,
@@ -3106,13 +3110,13 @@ index 000000000000..a6fbd581afe4
 +#endif //__IOVA_MNGR_H__
 diff --git a/drivers/misc/nvscic2c-pcie/module.c b/drivers/misc/nvscic2c-pcie/module.c
 new file mode 100644
-index 000000000000..87f076022f0f
+index 000000000000..7820eeab2159
 --- /dev/null
 +++ b/drivers/misc/nvscic2c-pcie/module.c
 @@ -0,0 +1,528 @@
 +// SPDX-License-Identifier: GPL-2.0+
 +/*
-+ * Copyright (c) 2022, NVIDIA CORPORATION.  All rights reserved.
++ * Copyright (c) 2022-2023, NVIDIA CORPORATION.  All rights reserved.
 + *
 + * This program is free software; you can redistribute it and/or modify it
 + * under the terms and conditions of the GNU General Public License,
@@ -3207,6 +3211,10 @@ index 000000000000..87f076022f0f
 +		cookie->msi_iova += size;
 +		return cookie->msi_iova - size;
 +	}
++	if (!iovad) {
++		pr_err("empty iovad\n");
++		return (dma_addr_t)NULL;
++	}
 +	shift = iova_shift(iovad);
 +	iova_len = size >> shift;
 +	/*
@@ -3224,10 +3232,6 @@ index 000000000000..87f076022f0f
 +	if (domain->geometry.force_aperture)
 +		dma_limit = min(dma_limit, domain->geometry.aperture_end);
 +
-+	if (!iovad) {
-+		pr_err("empty iovad\n");
-+		return (dma_addr_t)NULL;
-+	}
 +	/* Try to get PCI devices a SAC address */
 +	if (dma_limit > DMA_BIT_MASK(32) && dev_is_pci(dev)) {
 +		iova = alloc_iova_fast(iovad, iova_len,
@@ -3640,13 +3644,13 @@ index 000000000000..87f076022f0f
 +MODULE_AUTHOR(DRIVER_AUTHOR);
 diff --git a/drivers/misc/nvscic2c-pcie/module.h b/drivers/misc/nvscic2c-pcie/module.h
 new file mode 100644
-index 000000000000..088f5c65942d
+index 000000000000..6dc976d38349
 --- /dev/null
 +++ b/drivers/misc/nvscic2c-pcie/module.h
 @@ -0,0 +1,123 @@
 +/* SPDX-License-Identifier: GPL-2.0+ */
 +/*
-+ * Copyright (c) 2022, NVIDIA CORPORATION.  All rights reserved.
++ * Copyright (c) 2022-2023, NVIDIA CORPORATION.  All rights reserved.
 + *
 + * This program is free software; you can redistribute it and/or modify it
 + * under the terms and conditions of the GNU General Public License,
@@ -3769,13 +3773,13 @@ index 000000000000..088f5c65942d
 +#endif //__MODULE_H__
 diff --git a/drivers/misc/nvscic2c-pcie/nvscic2c-pcie-ioctl.h b/drivers/misc/nvscic2c-pcie/nvscic2c-pcie-ioctl.h
 new file mode 100644
-index 000000000000..79bdf13e8cde
+index 000000000000..40ad266671e5
 --- /dev/null
 +++ b/drivers/misc/nvscic2c-pcie/nvscic2c-pcie-ioctl.h
 @@ -0,0 +1,277 @@
 +/* SPDX-License-Identifier: GPL-2.0+ */
 +/*
-+ * Copyright (c) 2022, NVIDIA CORPORATION.  All rights reserved.
++ * Copyright (c) 2022-2023, NVIDIA CORPORATION.  All rights reserved.
 + *
 + * This program is free software; you can redistribute it and/or modify it
 + * under the terms and conditions of the GNU General Public License,
@@ -4052,13 +4056,13 @@ index 000000000000..79bdf13e8cde
 +#endif /*__UAPI_NVSCIC2C_PCIE_IOCTL_H__*/
 diff --git a/drivers/misc/nvscic2c-pcie/pci-client.c b/drivers/misc/nvscic2c-pcie/pci-client.c
 new file mode 100644
-index 000000000000..70e4de4c42c0
+index 000000000000..1e7ea22409e5
 --- /dev/null
 +++ b/drivers/misc/nvscic2c-pcie/pci-client.c
-@@ -0,0 +1,537 @@
+@@ -0,0 +1,536 @@
 +// SPDX-License-Identifier: GPL-2.0+
 +/*
-+ * Copyright (c) 2022, NVIDIA CORPORATION.  All rights reserved.
++ * Copyright (c) 2022-2023, NVIDIA CORPORATION.  All rights reserved.
 + *
 + * This program is free software; you can redistribute it and/or modify it
 + * under the terms and conditions of the GNU General Public License,
@@ -4592,16 +4596,15 @@ index 000000000000..70e4de4c42c0
 +	return  pdev;
 +
 +}
-+
 diff --git a/drivers/misc/nvscic2c-pcie/pci-client.h b/drivers/misc/nvscic2c-pcie/pci-client.h
 new file mode 100644
-index 000000000000..2590f3efd3b1
+index 000000000000..1c912b47d8a6
 --- /dev/null
 +++ b/drivers/misc/nvscic2c-pcie/pci-client.h
 @@ -0,0 +1,135 @@
 +/* SPDX-License-Identifier: GPL-2.0+ */
 +/*
-+ * Copyright (c) 2022, NVIDIA CORPORATION.  All rights reserved.
++ * Copyright (c) 2022-2023, NVIDIA CORPORATION.  All rights reserved.
 + *
 + * This program is free software; you can redistribute it and/or modify it
 + * under the terms and conditions of the GNU General Public License,
@@ -4736,13 +4739,13 @@ index 000000000000..2590f3efd3b1
 +#endif // __PCI_CLIENT_H__
 diff --git a/drivers/misc/nvscic2c-pcie/stream-extensions.c b/drivers/misc/nvscic2c-pcie/stream-extensions.c
 new file mode 100644
-index 000000000000..8ca7d01b9c75
+index 000000000000..bbe0d07d5815
 --- /dev/null
 +++ b/drivers/misc/nvscic2c-pcie/stream-extensions.c
 @@ -0,0 +1,1384 @@
 +// SPDX-License-Identifier: GPL-2.0+
 +/*
-+ * Copyright (c) 2022, NVIDIA CORPORATION.  All rights reserved.
++ * Copyright (c) 2022-2023, NVIDIA CORPORATION.  All rights reserved.
 + *
 + * This program is free software; you can redistribute it and/or modify it
 + * under the terms and conditions of the GNU General Public License,
@@ -6126,13 +6129,13 @@ index 000000000000..8ca7d01b9c75
 +}
 diff --git a/drivers/misc/nvscic2c-pcie/stream-extensions.h b/drivers/misc/nvscic2c-pcie/stream-extensions.h
 new file mode 100644
-index 000000000000..4ad68737cfe6
+index 000000000000..c895c853d7b0
 --- /dev/null
 +++ b/drivers/misc/nvscic2c-pcie/stream-extensions.h
 @@ -0,0 +1,53 @@
 +/* SPDX-License-Identifier: GPL-2.0+ */
 +/*
-+ * Copyright (c) 2022, NVIDIA CORPORATION.  All rights reserved.
++ * Copyright (c) 2022-2023, NVIDIA CORPORATION.  All rights reserved.
 + *
 + * This program is free software; you can redistribute it and/or modify it
 + * under the terms and conditions of the GNU General Public License,
@@ -6185,13 +6188,13 @@ index 000000000000..4ad68737cfe6
 +#endif //__STREAM_EXTENSIONS_H__
 diff --git a/drivers/misc/nvscic2c-pcie/tegra-pcie-dma-osi.h b/drivers/misc/nvscic2c-pcie/tegra-pcie-dma-osi.h
 new file mode 100644
-index 000000000000..5110a46f9c3a
+index 000000000000..3c82a64a4961
 --- /dev/null
 +++ b/drivers/misc/nvscic2c-pcie/tegra-pcie-dma-osi.h
 @@ -0,0 +1,176 @@
 +/* SPDX-License-Identifier: GPL-2.0+ */
 +/*
-+ * Copyright (c) 2021-2022, NVIDIA CORPORATION.  All rights reserved.
++ * Copyright (c) 2021-2023, NVIDIA CORPORATION.  All rights reserved.
 + *
 + * This program is free software; you can redistribute it and/or modify it
 + * under the terms and conditions of the GNU General Public License,
@@ -6367,13 +6370,13 @@ index 000000000000..5110a46f9c3a
 +#endif // TEGRA_PCIE_DMA_OSI_H
 diff --git a/drivers/misc/nvscic2c-pcie/tegra-pcie-edma.c b/drivers/misc/nvscic2c-pcie/tegra-pcie-edma.c
 new file mode 100644
-index 000000000000..ce4d84b2fe77
+index 000000000000..ee0cc44f0475
 --- /dev/null
 +++ b/drivers/misc/nvscic2c-pcie/tegra-pcie-edma.c
 @@ -0,0 +1,742 @@
 +/* SPDX-License-Identifier: GPL-2.0+ */
 +/*
-+ * Copyright (c) 2021-2022, NVIDIA CORPORATION.  All rights reserved.
++ * Copyright (c) 2021-2023, NVIDIA CORPORATION.  All rights reserved.
 + *
 + * This program is free software; you can redistribute it and/or modify it
 + * under the terms and conditions of the GNU General Public License,
@@ -6994,7 +6997,7 @@ index 000000000000..ce4d84b2fe77
 +		dma_ll_virt = &db->desc[ch->db_pos];
 +		dma_ll_virt->size = tx_info->desc[i].sz;
 +		/* calculate number of packets and add those many headers */
-+		total_sz += ((tx_info->desc[i].sz / ch->desc_sz) + 1) * 30;
++		total_sz += (u64)((tx_info->desc[i].sz / ch->desc_sz) + 1) * 30;
 +		total_sz += tx_info->desc[i].sz;
 +		dma_ll_virt->sar_low = lower_32_bits(tx_info->desc[i].src);
 +		dma_ll_virt->sar_high = upper_32_bits(tx_info->desc[i].src);
@@ -7115,13 +7118,13 @@ index 000000000000..ce4d84b2fe77
 +}
 diff --git a/drivers/misc/nvscic2c-pcie/tegra-pcie-edma.h b/drivers/misc/nvscic2c-pcie/tegra-pcie-edma.h
 new file mode 100644
-index 000000000000..335ec3055ba6
+index 000000000000..d9f94519f9a1
 --- /dev/null
 +++ b/drivers/misc/nvscic2c-pcie/tegra-pcie-edma.h
 @@ -0,0 +1,167 @@
 +// SPDX-License-Identifier: GPL-2.0+
 +/*
-+ * Copyright (c) 2021-2022, NVIDIA CORPORATION.  All rights reserved.
++ * Copyright (c) 2021-2023, NVIDIA CORPORATION.  All rights reserved.
 + *
 + * This program is free software; you can redistribute it and/or modify it
 + * under the terms and conditions of the GNU General Public License,
@@ -7288,13 +7291,13 @@ index 000000000000..335ec3055ba6
 +#endif //TEGRA_PCIE_EDMA_H
 diff --git a/drivers/misc/nvscic2c-pcie/vmap-internal.h b/drivers/misc/nvscic2c-pcie/vmap-internal.h
 new file mode 100644
-index 000000000000..8e4d4428fc8c
+index 000000000000..ccda45cb4ea8
 --- /dev/null
 +++ b/drivers/misc/nvscic2c-pcie/vmap-internal.h
 @@ -0,0 +1,183 @@
 +/* SPDX-License-Identifier: GPL-2.0+ */
 +/*
-+ * Copyright (c) 2022, NVIDIA CORPORATION.  All rights reserved.
++ * Copyright (c) 2022-2023, NVIDIA CORPORATION.  All rights reserved.
 + *
 + * This program is free software; you can redistribute it and/or modify it
 + * under the terms and conditions of the GNU General Public License,
@@ -7477,13 +7480,13 @@ index 000000000000..8e4d4428fc8c
 +#endif //__VMAP_INTERNAL_H__
 diff --git a/drivers/misc/nvscic2c-pcie/vmap-pin.c b/drivers/misc/nvscic2c-pcie/vmap-pin.c
 new file mode 100644
-index 000000000000..093ed28eb781
+index 000000000000..dcee29ea7c22
 --- /dev/null
 +++ b/drivers/misc/nvscic2c-pcie/vmap-pin.c
 @@ -0,0 +1,507 @@
 +// SPDX-License-Identifier: GPL-2.0+
 +/*
-+ * Copyright (c) 2022, NVIDIA CORPORATION.  All rights reserved.
++ * Copyright (c) 2022-2023, NVIDIA CORPORATION.  All rights reserved.
 + *
 + * This program is free software; you can redistribute it and/or modify it
 + * under the terms and conditions of the GNU General Public License,
@@ -7990,13 +7993,13 @@ index 000000000000..093ed28eb781
 +}
 diff --git a/drivers/misc/nvscic2c-pcie/vmap.c b/drivers/misc/nvscic2c-pcie/vmap.c
 new file mode 100644
-index 000000000000..0a443351ecf4
+index 000000000000..1d13ea06301f
 --- /dev/null
 +++ b/drivers/misc/nvscic2c-pcie/vmap.c
 @@ -0,0 +1,901 @@
 +// SPDX-License-Identifier: GPL-2.0+
 +/*
-+ * Copyright (c) 2022, NVIDIA CORPORATION.  All rights reserved.
++ * Copyright (c) 2022-2023, NVIDIA CORPORATION.  All rights reserved.
 + *
 + * This program is free software; you can redistribute it and/or modify it
 + * under the terms and conditions of the GNU General Public License,
@@ -8897,13 +8900,13 @@ index 000000000000..0a443351ecf4
 +}
 diff --git a/drivers/misc/nvscic2c-pcie/vmap.h b/drivers/misc/nvscic2c-pcie/vmap.h
 new file mode 100644
-index 000000000000..3c0a3efd98c8
+index 000000000000..f9b27c09654f
 --- /dev/null
 +++ b/drivers/misc/nvscic2c-pcie/vmap.h
 @@ -0,0 +1,264 @@
 +/* SPDX-License-Identifier: GPL-2.0+ */
 +/*
-+ * Copyright (c) 2022, NVIDIA CORPORATION.  All rights reserved.
++ * Copyright (c) 2022-2023, NVIDIA CORPORATION.  All rights reserved.
 + *
 + * This program is free software; you can redistribute it and/or modify it
 + * under the terms and conditions of the GNU General Public License,
