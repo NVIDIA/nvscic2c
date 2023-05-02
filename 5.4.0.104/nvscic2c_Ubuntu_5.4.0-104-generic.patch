@@ -1327,10 +1327,10 @@ index 000000000000..ebe6fa3b07e6
 +}
 diff --git a/drivers/misc/nvscic2c-pcie/config.h b/drivers/misc/nvscic2c-pcie/config.h
 new file mode 100644
-index 000000000000..c1bb4735c00e
+index 000000000000..90a2027dc0ca
 --- /dev/null
 +++ b/drivers/misc/nvscic2c-pcie/config.h
-@@ -0,0 +1,48 @@
+@@ -0,0 +1,49 @@
 +/* SPDX-License-Identifier: GPL-2.0+ */
 +/*
 + * Copyright (c) 2022-2023, NVIDIA CORPORATION.  All rights reserved.
@@ -1379,6 +1379,7 @@ index 000000000000..c1bb4735c00e
 +}
 +
 +#endif /* !NVSCIC2C_X86_PCIE_DT_H */
++
 diff --git a/drivers/misc/nvscic2c-pcie/descriptor.h b/drivers/misc/nvscic2c-pcie/descriptor.h
 new file mode 100644
 index 000000000000..a32d6fd40b91
@@ -4056,10 +4057,10 @@ index 000000000000..40ad266671e5
 +#endif /*__UAPI_NVSCIC2C_PCIE_IOCTL_H__*/
 diff --git a/drivers/misc/nvscic2c-pcie/pci-client.c b/drivers/misc/nvscic2c-pcie/pci-client.c
 new file mode 100644
-index 000000000000..1e7ea22409e5
+index 000000000000..a0f8d2facf29
 --- /dev/null
 +++ b/drivers/misc/nvscic2c-pcie/pci-client.c
-@@ -0,0 +1,536 @@
+@@ -0,0 +1,537 @@
 +// SPDX-License-Identifier: GPL-2.0+
 +/*
 + * Copyright (c) 2022-2023, NVIDIA CORPORATION.  All rights reserved.
@@ -4596,6 +4597,7 @@ index 000000000000..1e7ea22409e5
 +	return  pdev;
 +
 +}
++
 diff --git a/drivers/misc/nvscic2c-pcie/pci-client.h b/drivers/misc/nvscic2c-pcie/pci-client.h
 new file mode 100644
 index 000000000000..1c912b47d8a6
@@ -7993,10 +7995,10 @@ index 000000000000..dcee29ea7c22
 +}
 diff --git a/drivers/misc/nvscic2c-pcie/vmap.c b/drivers/misc/nvscic2c-pcie/vmap.c
 new file mode 100644
-index 000000000000..1d13ea06301f
+index 000000000000..93252b263ea0
 --- /dev/null
 +++ b/drivers/misc/nvscic2c-pcie/vmap.c
-@@ -0,0 +1,901 @@
+@@ -0,0 +1,914 @@
 +// SPDX-License-Identifier: GPL-2.0+
 +/*
 + * Copyright (c) 2022-2023, NVIDIA CORPORATION.  All rights reserved.
@@ -8064,12 +8066,16 @@ index 000000000000..1d13ea06301f
 +	page_virt_start = params->vaddr & GPU_PAGE_MASK;
 +	page_virt_end   = (params->vaddr + params->size + GPU_PAGE_SIZE - 1) & GPU_PAGE_MASK;
 +	mapped_size  = page_virt_end - page_virt_start;
-+
++#ifdef NVIDIA_P2P_CAP_GET_PAGES_PERSISTENT_API
++	ret = nvidia_p2p_get_pages_persistent(page_virt_start, mapped_size, &page_table, 0);
++#else
 +	ret = nvidia_p2p_get_pages(0, 0, page_virt_start,
 +				   mapped_size, &page_table,
 +				   NULL, NULL);
++#endif
 +	if (!page_table) {
-+		pr_err("Failed to create page table for virtual address %llu\n", params->vaddr);
++		pr_err("Failed to create page table for virtual address %llu, Error code: %d \n",
++			params->vaddr, ret);
 +		return -EFAULT;
 +	}
 +
@@ -8115,7 +8121,11 @@ index 000000000000..1d13ea06301f
 +	return 0;
 +err:
 +	mutex_unlock(&vmap_ctx->mem_idr_lock);
++#ifdef NVIDIA_P2P_CAP_GET_PAGES_PERSISTENT_API
++	(void)nvidia_p2p_put_pages_persistent(params->vaddr, page_table, 0);
++#else
 +	(void)nvidia_p2p_put_pages(0, 0, params->vaddr, page_table);
++#endif
 +	return ret;
 +}
 +#endif
@@ -8230,7 +8240,12 @@ index 000000000000..1d13ea06301f
 +		memobj_unpin(map->vmap_ctx, &map->pin);
 +#ifdef NVSCIC2C_GPU
 +		if (map->pin.page_table) {
++#ifdef NVIDIA_P2P_CAP_GET_PAGES_PERSISTENT_API
++			(void)nvidia_p2p_put_pages_persistent(map->pin.vaddr,
++							      map->pin.page_table, 0);
++#else
 +			(void)nvidia_p2p_put_pages(0, 0, map->pin.vaddr, map->pin.page_table);
++#endif
 +			map->pin.page_table = NULL;
 +		}
 +#endif
